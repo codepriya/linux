@@ -1,36 +1,5 @@
-/*
- * drivers/net/ethernet/mellanox/mlxsw/pci.c
- * Copyright (c) 2015 Mellanox Technologies. All rights reserved.
- * Copyright (c) 2015 Jiri Pirko <jiri@mellanox.com>
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the names of the copyright holders nor the names of its
- *    contributors may be used to endorse or promote products derived from
- *    this software without specific prior written permission.
- *
- * Alternatively, this software may be distributed under the terms of the
- * GNU General Public License ("GPL") version 2 as published by the Free
- * Software Foundation.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
- */
+// SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0
+/* Copyright (c) 2015-2018 Mellanox Technologies. All rights reserved */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -39,38 +8,19 @@
 #include <linux/device.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
-#include <linux/wait.h>
 #include <linux/types.h>
 #include <linux/skbuff.h>
 #include <linux/if_vlan.h>
 #include <linux/log2.h>
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
 #include <linux/string.h>
+#include <net/page_pool/helpers.h>
 
+#include "pci_hw.h"
 #include "pci.h"
 #include "core.h"
 #include "cmd.h"
 #include "port.h"
-
-static const char mlxsw_pci_driver_name[] = "mlxsw_pci";
-
-static const struct pci_device_id mlxsw_pci_id_table[] = {
-	{PCI_VDEVICE(MELLANOX, PCI_DEVICE_ID_MELLANOX_SWITCHX2), 0},
-	{0, }
-};
-
-static struct dentry *mlxsw_pci_dbg_root;
-
-static const char *mlxsw_pci_device_kind_get(const struct pci_device_id *id)
-{
-	switch (id->device) {
-	case PCI_DEVICE_ID_MELLANOX_SWITCHX2:
-		return MLXSW_DEVICE_KIND_SWITCHX2;
-	default:
-		BUG();
-	}
-}
+#include "resources.h"
 
 #define mlxsw_pci_write32(mlxsw_pci, reg, val) \
 	iowrite32be(val, (mlxsw_pci)->hw_addr + (MLXSW_PCI_ ## reg))
@@ -84,22 +34,12 @@ enum mlxsw_pci_queue_type {
 	MLXSW_PCI_QUEUE_TYPE_EQ,
 };
 
-static const char *mlxsw_pci_queue_type_str(enum mlxsw_pci_queue_type q_type)
-{
-	switch (q_type) {
-	case MLXSW_PCI_QUEUE_TYPE_SDQ:
-		return "sdq";
-	case MLXSW_PCI_QUEUE_TYPE_RDQ:
-		return "rdq";
-	case MLXSW_PCI_QUEUE_TYPE_CQ:
-		return "cq";
-	case MLXSW_PCI_QUEUE_TYPE_EQ:
-		return "eq";
-	}
-	BUG();
-}
-
 #define MLXSW_PCI_QUEUE_TYPE_COUNT	4
+
+enum mlxsw_pci_cq_type {
+	MLXSW_PCI_CQ_SDQ,
+	MLXSW_PCI_CQ_RDQ,
+};
 
 static const u16 mlxsw_pci_doorbell_type_offset[] = {
 	MLXSW_PCI_DOORBELL_SDQ_OFFSET,	/* for type MLXSW_PCI_QUEUE_TYPE_SDQ */
@@ -122,15 +62,11 @@ struct mlxsw_pci_mem_item {
 };
 
 struct mlxsw_pci_queue_elem_info {
+	struct page *pages[MLXSW_PCI_WQE_SG_ENTRIES];
 	char *elem; /* pointer to actual dma mapped element mem chunk */
-	union {
-		struct {
-			struct sk_buff *skb;
-		} sdq;
-		struct {
-			struct sk_buff *skb;
-		} rdq;
-	} u;
+	struct {
+		struct sk_buff *skb;
+	} sdq;
 };
 
 struct mlxsw_pci_queue {
@@ -143,18 +79,20 @@ struct mlxsw_pci_queue {
 	u8 num; /* queue number */
 	u8 elem_size; /* size of one element */
 	enum mlxsw_pci_queue_type type;
-	struct tasklet_struct tasklet; /* queue processing tasklet */
 	struct mlxsw_pci *pci;
 	union {
 		struct {
-			u32 comp_sdq_count;
-			u32 comp_rdq_count;
+			enum mlxsw_pci_cqe_v v;
+			struct mlxsw_pci_queue *dq;
+			struct napi_struct napi;
+			struct page_pool *page_pool;
 		} cq;
 		struct {
-			u32 ev_cmd_count;
-			u32 ev_comp_count;
-			u32 ev_other_count;
+			struct tasklet_struct tasklet;
 		} eq;
+		struct {
+			struct mlxsw_pci_queue *cq;
+		} rdq;
 	} u;
 };
 
@@ -166,33 +104,70 @@ struct mlxsw_pci_queue_type_group {
 struct mlxsw_pci {
 	struct pci_dev *pdev;
 	u8 __iomem *hw_addr;
+	u64 free_running_clock_offset;
+	u64 utc_sec_offset;
+	u64 utc_nsec_offset;
+	bool lag_mode_support;
+	bool cff_support;
+	enum mlxsw_cmd_mbox_config_profile_lag_mode lag_mode;
+	enum mlxsw_cmd_mbox_config_profile_flood_mode flood_mode;
+	u8 num_sg_entries; /* Number of scatter/gather entries for packets. */
 	struct mlxsw_pci_queue_type_group queues[MLXSW_PCI_QUEUE_TYPE_COUNT];
 	u32 doorbell_offset;
-	struct msix_entry msix_entry;
 	struct mlxsw_core *core;
 	struct {
-		u16 num_pages;
 		struct mlxsw_pci_mem_item *items;
+		unsigned int count;
 	} fw_area;
 	struct {
 		struct mlxsw_pci_mem_item out_mbox;
 		struct mlxsw_pci_mem_item in_mbox;
 		struct mutex lock; /* Lock access to command registers */
-		bool nopoll;
-		wait_queue_head_t wait;
-		bool wait_done;
 		struct {
 			u8 status;
 			u64 out_param;
 		} comp;
 	} cmd;
 	struct mlxsw_bus_info bus_info;
-	struct dentry *dbg_dir;
+	const struct pci_device_id *id;
+	enum mlxsw_pci_cqe_v max_cqe_ver; /* Maximal supported CQE version */
+	u8 num_cqs; /* Number of CQs */
+	u8 num_sdqs; /* Number of SDQs */
+	bool skip_reset;
+	struct net_device *napi_dev_tx;
+	struct net_device *napi_dev_rx;
 };
 
-static void mlxsw_pci_queue_tasklet_schedule(struct mlxsw_pci_queue *q)
+static int mlxsw_pci_napi_devs_init(struct mlxsw_pci *mlxsw_pci)
 {
-	tasklet_schedule(&q->tasklet);
+	int err;
+
+	mlxsw_pci->napi_dev_tx = alloc_netdev_dummy(0);
+	if (!mlxsw_pci->napi_dev_tx)
+		return -ENOMEM;
+	strscpy(mlxsw_pci->napi_dev_tx->name, "mlxsw_tx",
+		sizeof(mlxsw_pci->napi_dev_tx->name));
+
+	mlxsw_pci->napi_dev_rx = alloc_netdev_dummy(0);
+	if (!mlxsw_pci->napi_dev_rx) {
+		err = -ENOMEM;
+		goto err_alloc_rx;
+	}
+	strscpy(mlxsw_pci->napi_dev_rx->name, "mlxsw_rx",
+		sizeof(mlxsw_pci->napi_dev_rx->name));
+	dev_set_threaded(mlxsw_pci->napi_dev_rx, true);
+
+	return 0;
+
+err_alloc_rx:
+	free_netdev(mlxsw_pci->napi_dev_tx);
+	return err;
+}
+
+static void mlxsw_pci_napi_devs_fini(struct mlxsw_pci *mlxsw_pci)
+{
+	free_netdev(mlxsw_pci->napi_dev_rx);
+	free_netdev(mlxsw_pci->napi_dev_tx);
 }
 
 static char *__mlxsw_pci_queue_elem_get(struct mlxsw_pci_queue *q,
@@ -212,7 +187,7 @@ mlxsw_pci_queue_elem_info_producer_get(struct mlxsw_pci_queue *q)
 {
 	int index = q->producer_counter & (q->count - 1);
 
-	if ((q->producer_counter - q->consumer_counter) == q->count)
+	if ((u16) (q->producer_counter - q->consumer_counter) == q->count)
 		return NULL;
 	return mlxsw_pci_queue_elem_info_get(q, index);
 }
@@ -235,57 +210,11 @@ static bool mlxsw_pci_elem_hw_owned(struct mlxsw_pci_queue *q, bool owner_bit)
 	return owner_bit != !!(q->consumer_counter & q->count);
 }
 
-static char *mlxsw_pci_queue_sw_elem_get(struct mlxsw_pci_queue *q,
-					 u32 (*get_elem_owner_func)(char *))
-{
-	struct mlxsw_pci_queue_elem_info *elem_info;
-	char *elem;
-	bool owner_bit;
-
-	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
-	elem = elem_info->elem;
-	owner_bit = get_elem_owner_func(elem);
-	if (mlxsw_pci_elem_hw_owned(q, owner_bit))
-		return NULL;
-	q->consumer_counter++;
-	rmb(); /* make sure we read owned bit before the rest of elem */
-	return elem;
-}
-
 static struct mlxsw_pci_queue_type_group *
 mlxsw_pci_queue_type_group_get(struct mlxsw_pci *mlxsw_pci,
 			       enum mlxsw_pci_queue_type q_type)
 {
 	return &mlxsw_pci->queues[q_type];
-}
-
-static u8 __mlxsw_pci_queue_count(struct mlxsw_pci *mlxsw_pci,
-				  enum mlxsw_pci_queue_type q_type)
-{
-	struct mlxsw_pci_queue_type_group *queue_group;
-
-	queue_group = mlxsw_pci_queue_type_group_get(mlxsw_pci, q_type);
-	return queue_group->count;
-}
-
-static u8 mlxsw_pci_sdq_count(struct mlxsw_pci *mlxsw_pci)
-{
-	return __mlxsw_pci_queue_count(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_SDQ);
-}
-
-static u8 mlxsw_pci_rdq_count(struct mlxsw_pci *mlxsw_pci)
-{
-	return __mlxsw_pci_queue_count(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_RDQ);
-}
-
-static u8 mlxsw_pci_cq_count(struct mlxsw_pci *mlxsw_pci)
-{
-	return __mlxsw_pci_queue_count(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_CQ);
-}
-
-static u8 mlxsw_pci_eq_count(struct mlxsw_pci *mlxsw_pci)
-{
-	return __mlxsw_pci_queue_count(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_EQ);
 }
 
 static struct mlxsw_pci_queue *
@@ -302,23 +231,16 @@ static struct mlxsw_pci_queue *mlxsw_pci_sdq_get(struct mlxsw_pci *mlxsw_pci,
 				     MLXSW_PCI_QUEUE_TYPE_SDQ, q_num);
 }
 
-static struct mlxsw_pci_queue *mlxsw_pci_rdq_get(struct mlxsw_pci *mlxsw_pci,
-						 u8 q_num)
-{
-	return __mlxsw_pci_queue_get(mlxsw_pci,
-				     MLXSW_PCI_QUEUE_TYPE_RDQ, q_num);
-}
-
 static struct mlxsw_pci_queue *mlxsw_pci_cq_get(struct mlxsw_pci *mlxsw_pci,
 						u8 q_num)
 {
 	return __mlxsw_pci_queue_get(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_CQ, q_num);
 }
 
-static struct mlxsw_pci_queue *mlxsw_pci_eq_get(struct mlxsw_pci *mlxsw_pci,
-						u8 q_num)
+static struct mlxsw_pci_queue *mlxsw_pci_eq_get(struct mlxsw_pci *mlxsw_pci)
 {
-	return __mlxsw_pci_queue_get(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_EQ, q_num);
+	/* There is only one EQ at index 0. */
+	return __mlxsw_pci_queue_get(mlxsw_pci, MLXSW_PCI_QUEUE_TYPE_EQ, 0);
 }
 
 static void __mlxsw_pci_queue_doorbell_set(struct mlxsw_pci *mlxsw_pci,
@@ -373,15 +295,25 @@ static dma_addr_t __mlxsw_pci_queue_page_get(struct mlxsw_pci_queue *q,
 static int mlxsw_pci_sdq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 			      struct mlxsw_pci_queue *q)
 {
+	struct mlxsw_pci_queue *cq;
+	int tclass;
+	u8 cq_num;
+	int lp;
 	int i;
 	int err;
 
 	q->producer_counter = 0;
 	q->consumer_counter = 0;
+	tclass = q->num == MLXSW_PCI_SDQ_EMAD_INDEX ? MLXSW_PCI_SDQ_EMAD_TC :
+						      MLXSW_PCI_SDQ_CTL_TC;
+	lp = q->num == MLXSW_PCI_SDQ_EMAD_INDEX ? MLXSW_CMD_MBOX_SW2HW_DQ_SDQ_LP_IGNORE_WQE :
+						  MLXSW_CMD_MBOX_SW2HW_DQ_SDQ_LP_WQE;
 
 	/* Set CQ of same number of this SDQ. */
-	mlxsw_cmd_mbox_sw2hw_dq_cq_set(mbox, q->num);
-	mlxsw_cmd_mbox_sw2hw_dq_sdq_tclass_set(mbox, 7);
+	cq_num = q->num;
+	mlxsw_cmd_mbox_sw2hw_dq_cq_set(mbox, cq_num);
+	mlxsw_cmd_mbox_sw2hw_dq_sdq_lp_set(mbox, lp);
+	mlxsw_cmd_mbox_sw2hw_dq_sdq_tclass_set(mbox, tclass);
 	mlxsw_cmd_mbox_sw2hw_dq_log2_dq_sz_set(mbox, 3); /* 8 pages */
 	for (i = 0; i < MLXSW_PCI_AQ_PAGES; i++) {
 		dma_addr_t mapaddr = __mlxsw_pci_queue_page_get(q, i);
@@ -392,6 +324,9 @@ static int mlxsw_pci_sdq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	err = mlxsw_cmd_sw2hw_sdq(mlxsw_pci->core, mbox, q->num);
 	if (err)
 		return err;
+
+	cq = mlxsw_pci_cq_get(mlxsw_pci, cq_num);
+	cq->u.cq.dq = q;
 	mlxsw_pci_queue_doorbell_producer_ring(mlxsw_pci, q);
 	return 0;
 }
@@ -402,24 +337,27 @@ static void mlxsw_pci_sdq_fini(struct mlxsw_pci *mlxsw_pci,
 	mlxsw_cmd_hw2sw_sdq(mlxsw_pci->core, q->num);
 }
 
-static int mlxsw_pci_sdq_dbg_read(struct seq_file *file, void *data)
-{
-	struct mlxsw_pci *mlxsw_pci = dev_get_drvdata(file->private);
-	struct mlxsw_pci_queue *q;
-	int i;
-	static const char hdr[] =
-		"NUM PROD_COUNT CONS_COUNT COUNT\n";
+#define MLXSW_PCI_SKB_HEADROOM (NET_SKB_PAD + NET_IP_ALIGN)
 
-	seq_printf(file, hdr);
-	for (i = 0; i < mlxsw_pci_sdq_count(mlxsw_pci); i++) {
-		q = mlxsw_pci_sdq_get(mlxsw_pci, i);
-		spin_lock_bh(&q->lock);
-		seq_printf(file, "%3d %10d %10d %5d\n",
-			   i, q->producer_counter, q->consumer_counter,
-			   q->count);
-		spin_unlock_bh(&q->lock);
+#define MLXSW_PCI_RX_BUF_SW_OVERHEAD		\
+		(MLXSW_PCI_SKB_HEADROOM +	\
+		SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+
+static void
+mlxsw_pci_wqe_rx_frag_set(struct mlxsw_pci *mlxsw_pci, struct page *page,
+			  char *wqe, int index, size_t frag_len)
+{
+	dma_addr_t mapaddr;
+
+	mapaddr = page_pool_get_dma_addr(page);
+
+	if (index == 0) {
+		mapaddr += MLXSW_PCI_SKB_HEADROOM;
+		frag_len = frag_len - MLXSW_PCI_RX_BUF_SW_OVERHEAD;
 	}
-	return 0;
+
+	mlxsw_pci_wqe_address_set(wqe, index, mapaddr);
+	mlxsw_pci_wqe_byte_count_set(wqe, index, frag_len);
 }
 
 static int mlxsw_pci_wqe_frag_map(struct mlxsw_pci *mlxsw_pci, char *wqe,
@@ -429,10 +367,9 @@ static int mlxsw_pci_wqe_frag_map(struct mlxsw_pci *mlxsw_pci, char *wqe,
 	struct pci_dev *pdev = mlxsw_pci->pdev;
 	dma_addr_t mapaddr;
 
-	mapaddr = pci_map_single(pdev, frag_data, frag_len, direction);
-	if (unlikely(pci_dma_mapping_error(pdev, mapaddr))) {
-		if (net_ratelimit())
-			dev_err(&pdev->dev, "failed to dma map tx frag\n");
+	mapaddr = dma_map_single(&pdev->dev, frag_data, frag_len, direction);
+	if (unlikely(dma_mapping_error(&pdev->dev, mapaddr))) {
+		dev_err_ratelimited(&pdev->dev, "failed to dma map tx frag\n");
 		return -EIO;
 	}
 	mlxsw_pci_wqe_address_set(wqe, index, mapaddr);
@@ -449,64 +386,163 @@ static void mlxsw_pci_wqe_frag_unmap(struct mlxsw_pci *mlxsw_pci, char *wqe,
 
 	if (!frag_len)
 		return;
-	pci_unmap_single(pdev, mapaddr, frag_len, direction);
+	dma_unmap_single(&pdev->dev, mapaddr, frag_len, direction);
 }
 
-static int mlxsw_pci_rdq_skb_alloc(struct mlxsw_pci *mlxsw_pci,
-				   struct mlxsw_pci_queue_elem_info *elem_info)
+static struct sk_buff *mlxsw_pci_rdq_build_skb(struct page *pages[],
+					       u16 byte_count)
 {
-	size_t buf_len = MLXSW_PORT_MAX_MTU;
-	char *wqe = elem_info->elem;
+	unsigned int linear_data_size;
 	struct sk_buff *skb;
-	int err;
+	int page_index = 0;
+	bool linear_only;
+	void *data;
 
-	elem_info->u.rdq.skb = NULL;
-	skb = netdev_alloc_skb_ip_align(NULL, buf_len);
-	if (!skb)
+	data = page_address(pages[page_index]);
+	net_prefetch(data);
+
+	skb = napi_build_skb(data, PAGE_SIZE);
+	if (unlikely(!skb))
+		return ERR_PTR(-ENOMEM);
+
+	linear_only = byte_count + MLXSW_PCI_RX_BUF_SW_OVERHEAD <= PAGE_SIZE;
+	linear_data_size = linear_only ? byte_count :
+					 PAGE_SIZE -
+					 MLXSW_PCI_RX_BUF_SW_OVERHEAD;
+
+	skb_reserve(skb, MLXSW_PCI_SKB_HEADROOM);
+	skb_put(skb, linear_data_size);
+
+	if (linear_only)
+		return skb;
+
+	byte_count -= linear_data_size;
+	page_index++;
+
+	while (byte_count > 0) {
+		unsigned int frag_size;
+		struct page *page;
+
+		page = pages[page_index];
+		frag_size = min(byte_count, PAGE_SIZE);
+		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+				page, 0, frag_size, PAGE_SIZE);
+		byte_count -= frag_size;
+		page_index++;
+	}
+
+	return skb;
+}
+
+static int mlxsw_pci_rdq_page_alloc(struct mlxsw_pci_queue *q,
+				    struct mlxsw_pci_queue_elem_info *elem_info,
+				    int index)
+{
+	struct mlxsw_pci_queue *cq = q->u.rdq.cq;
+	char *wqe = elem_info->elem;
+	struct page *page;
+
+	page = page_pool_dev_alloc_pages(cq->u.cq.page_pool);
+	if (unlikely(!page))
 		return -ENOMEM;
 
-	/* Assume that wqe was previously zeroed. */
+	mlxsw_pci_wqe_rx_frag_set(q->pci, page, wqe, index, PAGE_SIZE);
+	elem_info->pages[index] = page;
+	return 0;
+}
 
-	err = mlxsw_pci_wqe_frag_map(mlxsw_pci, wqe, 0, skb->data,
-				     buf_len, DMA_FROM_DEVICE);
-	if (err)
-		goto err_frag_map;
+static void mlxsw_pci_rdq_page_free(struct mlxsw_pci_queue *q,
+				    struct mlxsw_pci_queue_elem_info *elem_info,
+				    int index)
+{
+	struct mlxsw_pci_queue *cq = q->u.rdq.cq;
 
-	elem_info->u.rdq.skb = skb;
+	page_pool_put_page(cq->u.cq.page_pool, elem_info->pages[index], -1,
+			   false);
+}
+
+static u8 mlxsw_pci_num_sg_entries_get(u16 byte_count)
+{
+	return DIV_ROUND_UP(byte_count + MLXSW_PCI_RX_BUF_SW_OVERHEAD,
+			    PAGE_SIZE);
+}
+
+static int
+mlxsw_pci_elem_info_pages_ref_store(const struct mlxsw_pci_queue *q,
+				    const struct mlxsw_pci_queue_elem_info *el,
+				    u16 byte_count, struct page *pages[],
+				    u8 *p_num_sg_entries)
+{
+	u8 num_sg_entries;
+	int i;
+
+	num_sg_entries = mlxsw_pci_num_sg_entries_get(byte_count);
+	if (WARN_ON_ONCE(num_sg_entries > q->pci->num_sg_entries))
+		return -EINVAL;
+
+	for (i = 0; i < num_sg_entries; i++)
+		pages[i] = el->pages[i];
+
+	*p_num_sg_entries = num_sg_entries;
+	return 0;
+}
+
+static int
+mlxsw_pci_rdq_pages_alloc(struct mlxsw_pci_queue *q,
+			  struct mlxsw_pci_queue_elem_info *elem_info,
+			  u8 num_sg_entries)
+{
+	struct page *old_pages[MLXSW_PCI_WQE_SG_ENTRIES];
+	struct mlxsw_pci_queue *cq = q->u.rdq.cq;
+	int i, err;
+
+	for (i = 0; i < num_sg_entries; i++) {
+		old_pages[i] = elem_info->pages[i];
+		err = mlxsw_pci_rdq_page_alloc(q, elem_info, i);
+		if (err) {
+			dev_err_ratelimited(&q->pci->pdev->dev, "Failed to alloc page\n");
+			goto err_page_alloc;
+		}
+	}
+
 	return 0;
 
-err_frag_map:
-	dev_kfree_skb_any(skb);
+err_page_alloc:
+	for (i--; i >= 0; i--)
+		page_pool_recycle_direct(cq->u.cq.page_pool, old_pages[i]);
+
 	return err;
 }
 
-static void mlxsw_pci_rdq_skb_free(struct mlxsw_pci *mlxsw_pci,
-				   struct mlxsw_pci_queue_elem_info *elem_info)
+static void
+mlxsw_pci_rdq_pages_recycle(struct mlxsw_pci_queue *q, struct page *pages[],
+			    u8 num_sg_entries)
 {
-	struct sk_buff *skb;
-	char *wqe;
+	struct mlxsw_pci_queue *cq = q->u.rdq.cq;
+	int i;
 
-	skb = elem_info->u.rdq.skb;
-	wqe = elem_info->elem;
-
-	mlxsw_pci_wqe_frag_unmap(mlxsw_pci, wqe, 0, DMA_FROM_DEVICE);
-	dev_kfree_skb_any(skb);
+	for (i = 0; i < num_sg_entries; i++)
+		page_pool_recycle_direct(cq->u.cq.page_pool, pages[i]);
 }
 
 static int mlxsw_pci_rdq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 			      struct mlxsw_pci_queue *q)
 {
 	struct mlxsw_pci_queue_elem_info *elem_info;
-	int i;
+	u8 sdq_count = mlxsw_pci->num_sdqs;
+	struct mlxsw_pci_queue *cq;
+	u8 cq_num;
+	int i, j;
 	int err;
 
 	q->producer_counter = 0;
 	q->consumer_counter = 0;
 
 	/* Set CQ of same number of this RDQ with base
-	 * above MLXSW_PCI_SDQS_MAX as the lower ones are assigned to SDQs.
+	 * above SDQ count as the lower ones are assigned to SDQs.
 	 */
-	mlxsw_cmd_mbox_sw2hw_dq_cq_set(mbox, q->num + MLXSW_PCI_SDQS_COUNT);
+	cq_num = sdq_count + q->num;
+	mlxsw_cmd_mbox_sw2hw_dq_cq_set(mbox, cq_num);
 	mlxsw_cmd_mbox_sw2hw_dq_log2_dq_sz_set(mbox, 3); /* 8 pages */
 	for (i = 0; i < MLXSW_PCI_AQ_PAGES; i++) {
 		dma_addr_t mapaddr = __mlxsw_pci_queue_page_get(q, i);
@@ -518,14 +554,21 @@ static int mlxsw_pci_rdq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	if (err)
 		return err;
 
+	cq = mlxsw_pci_cq_get(mlxsw_pci, cq_num);
+	cq->u.cq.dq = q;
+	q->u.rdq.cq = cq;
+
 	mlxsw_pci_queue_doorbell_producer_ring(mlxsw_pci, q);
 
 	for (i = 0; i < q->count; i++) {
 		elem_info = mlxsw_pci_queue_elem_info_producer_get(q);
 		BUG_ON(!elem_info);
-		err = mlxsw_pci_rdq_skb_alloc(mlxsw_pci, elem_info);
-		if (err)
-			goto rollback;
+
+		for (j = 0; j < mlxsw_pci->num_sg_entries; j++) {
+			err = mlxsw_pci_rdq_page_alloc(q, elem_info, j);
+			if (err)
+				goto rollback;
+		}
 		/* Everything is set up, ring doorbell to pass elem to HW */
 		q->producer_counter++;
 		mlxsw_pci_queue_doorbell_producer_ring(mlxsw_pci, q);
@@ -536,8 +579,12 @@ static int mlxsw_pci_rdq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 rollback:
 	for (i--; i >= 0; i--) {
 		elem_info = mlxsw_pci_queue_elem_info_get(q, i);
-		mlxsw_pci_rdq_skb_free(mlxsw_pci, elem_info);
+		for (j--; j >= 0; j--)
+			mlxsw_pci_rdq_page_free(q, elem_info, j);
+		j = mlxsw_pci->num_sg_entries;
 	}
+	q->u.rdq.cq = NULL;
+	cq->u.cq.dq = NULL;
 	mlxsw_cmd_hw2sw_rdq(mlxsw_pci->core, q->num);
 
 	return err;
@@ -547,38 +594,428 @@ static void mlxsw_pci_rdq_fini(struct mlxsw_pci *mlxsw_pci,
 			       struct mlxsw_pci_queue *q)
 {
 	struct mlxsw_pci_queue_elem_info *elem_info;
-	int i;
+	int i, j;
 
 	mlxsw_cmd_hw2sw_rdq(mlxsw_pci->core, q->num);
 	for (i = 0; i < q->count; i++) {
 		elem_info = mlxsw_pci_queue_elem_info_get(q, i);
-		mlxsw_pci_rdq_skb_free(mlxsw_pci, elem_info);
+		for (j = 0; j < mlxsw_pci->num_sg_entries; j++)
+			mlxsw_pci_rdq_page_free(q, elem_info, j);
 	}
 }
 
-static int mlxsw_pci_rdq_dbg_read(struct seq_file *file, void *data)
+static void mlxsw_pci_cq_pre_init(struct mlxsw_pci *mlxsw_pci,
+				  struct mlxsw_pci_queue *q)
 {
-	struct mlxsw_pci *mlxsw_pci = dev_get_drvdata(file->private);
-	struct mlxsw_pci_queue *q;
-	int i;
-	static const char hdr[] =
-		"NUM PROD_COUNT CONS_COUNT COUNT\n";
+	q->u.cq.v = mlxsw_pci->max_cqe_ver;
 
-	seq_printf(file, hdr);
-	for (i = 0; i < mlxsw_pci_rdq_count(mlxsw_pci); i++) {
-		q = mlxsw_pci_rdq_get(mlxsw_pci, i);
-		spin_lock_bh(&q->lock);
-		seq_printf(file, "%3d %10d %10d %5d\n",
-			   i, q->producer_counter, q->consumer_counter,
-			   q->count);
-		spin_unlock_bh(&q->lock);
+	if (q->u.cq.v == MLXSW_PCI_CQE_V2 &&
+	    q->num < mlxsw_pci->num_sdqs &&
+	    !mlxsw_core_sdq_supports_cqe_v2(mlxsw_pci->core))
+		q->u.cq.v = MLXSW_PCI_CQE_V1;
+}
+
+static unsigned int mlxsw_pci_read32_off(struct mlxsw_pci *mlxsw_pci,
+					 ptrdiff_t off)
+{
+	return ioread32be(mlxsw_pci->hw_addr + off);
+}
+
+static void mlxsw_pci_skb_cb_ts_set(struct mlxsw_pci *mlxsw_pci,
+				    struct sk_buff *skb,
+				    enum mlxsw_pci_cqe_v cqe_v, char *cqe)
+{
+	u8 ts_type;
+
+	if (cqe_v != MLXSW_PCI_CQE_V2)
+		return;
+
+	ts_type = mlxsw_pci_cqe2_time_stamp_type_get(cqe);
+
+	if (ts_type != MLXSW_PCI_CQE_TIME_STAMP_TYPE_UTC &&
+	    ts_type != MLXSW_PCI_CQE_TIME_STAMP_TYPE_MIRROR_UTC)
+		return;
+
+	mlxsw_skb_cb(skb)->cqe_ts.sec = mlxsw_pci_cqe2_time_stamp_sec_get(cqe);
+	mlxsw_skb_cb(skb)->cqe_ts.nsec =
+		mlxsw_pci_cqe2_time_stamp_nsec_get(cqe);
+}
+
+static void mlxsw_pci_cqe_sdq_handle(struct mlxsw_pci *mlxsw_pci,
+				     struct mlxsw_pci_queue *q,
+				     u16 consumer_counter_limit,
+				     enum mlxsw_pci_cqe_v cqe_v,
+				     char *cqe, int budget)
+{
+	struct pci_dev *pdev = mlxsw_pci->pdev;
+	struct mlxsw_pci_queue_elem_info *elem_info;
+	struct mlxsw_tx_info tx_info;
+	char *wqe;
+	struct sk_buff *skb;
+	int i;
+
+	spin_lock(&q->lock);
+	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
+	tx_info = mlxsw_skb_cb(elem_info->sdq.skb)->tx_info;
+	skb = elem_info->sdq.skb;
+	wqe = elem_info->elem;
+	for (i = 0; i < MLXSW_PCI_WQE_SG_ENTRIES; i++)
+		mlxsw_pci_wqe_frag_unmap(mlxsw_pci, wqe, i, DMA_TO_DEVICE);
+
+	if (unlikely(!tx_info.is_emad &&
+		     skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
+		mlxsw_pci_skb_cb_ts_set(mlxsw_pci, skb, cqe_v, cqe);
+		mlxsw_core_ptp_transmitted(mlxsw_pci->core, skb,
+					   tx_info.local_port);
+		skb = NULL;
 	}
+
+	if (skb)
+		napi_consume_skb(skb, budget);
+	elem_info->sdq.skb = NULL;
+
+	if (q->consumer_counter++ != consumer_counter_limit)
+		dev_dbg_ratelimited(&pdev->dev, "Consumer counter does not match limit in SDQ\n");
+	spin_unlock(&q->lock);
+}
+
+static void mlxsw_pci_cqe_rdq_md_tx_port_init(struct sk_buff *skb,
+					      const char *cqe)
+{
+	struct mlxsw_skb_cb *cb = mlxsw_skb_cb(skb);
+
+	if (mlxsw_pci_cqe2_tx_lag_get(cqe)) {
+		cb->rx_md_info.tx_port_is_lag = true;
+		cb->rx_md_info.tx_lag_id = mlxsw_pci_cqe2_tx_lag_id_get(cqe);
+		cb->rx_md_info.tx_lag_port_index =
+			mlxsw_pci_cqe2_tx_lag_subport_get(cqe);
+	} else {
+		cb->rx_md_info.tx_port_is_lag = false;
+		cb->rx_md_info.tx_sys_port =
+			mlxsw_pci_cqe2_tx_system_port_get(cqe);
+	}
+
+	if (cb->rx_md_info.tx_sys_port != MLXSW_PCI_CQE2_TX_PORT_MULTI_PORT &&
+	    cb->rx_md_info.tx_sys_port != MLXSW_PCI_CQE2_TX_PORT_INVALID)
+		cb->rx_md_info.tx_port_valid = 1;
+	else
+		cb->rx_md_info.tx_port_valid = 0;
+}
+
+static void mlxsw_pci_cqe_rdq_md_init(struct sk_buff *skb, const char *cqe)
+{
+	struct mlxsw_skb_cb *cb = mlxsw_skb_cb(skb);
+
+	cb->rx_md_info.tx_congestion = mlxsw_pci_cqe2_mirror_cong_get(cqe);
+	if (cb->rx_md_info.tx_congestion != MLXSW_PCI_CQE2_MIRROR_CONG_INVALID)
+		cb->rx_md_info.tx_congestion_valid = 1;
+	else
+		cb->rx_md_info.tx_congestion_valid = 0;
+	cb->rx_md_info.tx_congestion <<= MLXSW_PCI_CQE2_MIRROR_CONG_SHIFT;
+
+	cb->rx_md_info.latency = mlxsw_pci_cqe2_mirror_latency_get(cqe);
+	if (cb->rx_md_info.latency != MLXSW_PCI_CQE2_MIRROR_LATENCY_INVALID)
+		cb->rx_md_info.latency_valid = 1;
+	else
+		cb->rx_md_info.latency_valid = 0;
+
+	cb->rx_md_info.tx_tc = mlxsw_pci_cqe2_mirror_tclass_get(cqe);
+	if (cb->rx_md_info.tx_tc != MLXSW_PCI_CQE2_MIRROR_TCLASS_INVALID)
+		cb->rx_md_info.tx_tc_valid = 1;
+	else
+		cb->rx_md_info.tx_tc_valid = 0;
+
+	mlxsw_pci_cqe_rdq_md_tx_port_init(skb, cqe);
+}
+
+static void mlxsw_pci_cqe_rdq_handle(struct mlxsw_pci *mlxsw_pci,
+				     struct mlxsw_pci_queue *q,
+				     u16 consumer_counter_limit,
+				     enum mlxsw_pci_cqe_v cqe_v, char *cqe)
+{
+	struct pci_dev *pdev = mlxsw_pci->pdev;
+	struct page *pages[MLXSW_PCI_WQE_SG_ENTRIES];
+	struct mlxsw_pci_queue_elem_info *elem_info;
+	struct mlxsw_rx_info rx_info = {};
+	struct sk_buff *skb;
+	u8 num_sg_entries;
+	u16 byte_count;
+	int err;
+
+	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
+
+	if (q->consumer_counter++ != consumer_counter_limit)
+		dev_dbg_ratelimited(&pdev->dev, "Consumer counter does not match limit in RDQ\n");
+
+	byte_count = mlxsw_pci_cqe_byte_count_get(cqe);
+	if (mlxsw_pci_cqe_crc_get(cqe_v, cqe))
+		byte_count -= ETH_FCS_LEN;
+
+	err = mlxsw_pci_elem_info_pages_ref_store(q, elem_info, byte_count,
+						  pages, &num_sg_entries);
+	if (err)
+		goto out;
+
+	err = mlxsw_pci_rdq_pages_alloc(q, elem_info, num_sg_entries);
+	if (err)
+		goto out;
+
+	skb = mlxsw_pci_rdq_build_skb(pages, byte_count);
+	if (IS_ERR(skb)) {
+		dev_err_ratelimited(&pdev->dev, "Failed to build skb for RDQ\n");
+		mlxsw_pci_rdq_pages_recycle(q, pages, num_sg_entries);
+		goto out;
+	}
+
+	skb_mark_for_recycle(skb);
+
+	if (mlxsw_pci_cqe_lag_get(cqe_v, cqe)) {
+		rx_info.is_lag = true;
+		rx_info.u.lag_id = mlxsw_pci_cqe_lag_id_get(cqe_v, cqe);
+		rx_info.lag_port_index =
+			mlxsw_pci_cqe_lag_subport_get(cqe_v, cqe);
+	} else {
+		rx_info.is_lag = false;
+		rx_info.u.sys_port = mlxsw_pci_cqe_system_port_get(cqe);
+	}
+
+	rx_info.trap_id = mlxsw_pci_cqe_trap_id_get(cqe);
+
+	if (rx_info.trap_id == MLXSW_TRAP_ID_DISCARD_INGRESS_ACL ||
+	    rx_info.trap_id == MLXSW_TRAP_ID_DISCARD_EGRESS_ACL) {
+		u32 cookie_index = 0;
+
+		if (mlxsw_pci->max_cqe_ver >= MLXSW_PCI_CQE_V2)
+			cookie_index = mlxsw_pci_cqe2_user_def_val_orig_pkt_len_get(cqe);
+		mlxsw_skb_cb(skb)->rx_md_info.cookie_index = cookie_index;
+	} else if (rx_info.trap_id >= MLXSW_TRAP_ID_MIRROR_SESSION0 &&
+		   rx_info.trap_id <= MLXSW_TRAP_ID_MIRROR_SESSION7 &&
+		   mlxsw_pci->max_cqe_ver >= MLXSW_PCI_CQE_V2) {
+		rx_info.mirror_reason = mlxsw_pci_cqe2_mirror_reason_get(cqe);
+		mlxsw_pci_cqe_rdq_md_init(skb, cqe);
+	} else if (rx_info.trap_id == MLXSW_TRAP_ID_PKT_SAMPLE &&
+		   mlxsw_pci->max_cqe_ver >= MLXSW_PCI_CQE_V2) {
+		mlxsw_pci_cqe_rdq_md_tx_port_init(skb, cqe);
+	}
+
+	mlxsw_pci_skb_cb_ts_set(mlxsw_pci, skb, cqe_v, cqe);
+
+	mlxsw_core_skb_receive(mlxsw_pci->core, skb, &rx_info);
+
+out:
+	q->producer_counter++;
+	return;
+}
+
+static char *mlxsw_pci_cq_sw_cqe_get(struct mlxsw_pci_queue *q)
+{
+	struct mlxsw_pci_queue_elem_info *elem_info;
+	char *elem;
+	bool owner_bit;
+
+	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
+	elem = elem_info->elem;
+	owner_bit = mlxsw_pci_cqe_owner_get(q->u.cq.v, elem);
+	if (mlxsw_pci_elem_hw_owned(q, owner_bit))
+		return NULL;
+	q->consumer_counter++;
+	rmb(); /* make sure we read owned bit before the rest of elem */
+	return elem;
+}
+
+static bool mlxsw_pci_cq_cqe_to_handle(struct mlxsw_pci_queue *q)
+{
+	struct mlxsw_pci_queue_elem_info *elem_info;
+	bool owner_bit;
+
+	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
+	owner_bit = mlxsw_pci_cqe_owner_get(q->u.cq.v, elem_info->elem);
+	return !mlxsw_pci_elem_hw_owned(q, owner_bit);
+}
+
+static int mlxsw_pci_napi_poll_cq_rx(struct napi_struct *napi, int budget)
+{
+	struct mlxsw_pci_queue *q = container_of(napi, struct mlxsw_pci_queue,
+						 u.cq.napi);
+	struct mlxsw_pci_queue *rdq = q->u.cq.dq;
+	struct mlxsw_pci *mlxsw_pci = q->pci;
+	int work_done = 0;
+	char *cqe;
+
+	/* If the budget is 0, Rx processing should be skipped. */
+	if (unlikely(!budget))
+		return 0;
+
+	while ((cqe = mlxsw_pci_cq_sw_cqe_get(q))) {
+		u16 wqe_counter = mlxsw_pci_cqe_wqe_counter_get(cqe);
+		u8 sendq = mlxsw_pci_cqe_sr_get(q->u.cq.v, cqe);
+		u8 dqn = mlxsw_pci_cqe_dqn_get(q->u.cq.v, cqe);
+
+		if (unlikely(sendq)) {
+			WARN_ON_ONCE(1);
+			continue;
+		}
+
+		if (unlikely(dqn != rdq->num)) {
+			WARN_ON_ONCE(1);
+			continue;
+		}
+
+		mlxsw_pci_cqe_rdq_handle(mlxsw_pci, rdq,
+					 wqe_counter, q->u.cq.v, cqe);
+
+		if (++work_done == budget)
+			break;
+	}
+
+	mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
+	mlxsw_pci_queue_doorbell_producer_ring(mlxsw_pci, rdq);
+
+	if (work_done < budget)
+		goto processing_completed;
+
+	/* The driver still has outstanding work to do, budget was exhausted.
+	 * Return exactly budget. In that case, the NAPI instance will be polled
+	 * again.
+	 */
+	if (mlxsw_pci_cq_cqe_to_handle(q))
+		goto out;
+
+	/* The driver processed all the completions and handled exactly
+	 * 'budget'. Return 'budget - 1' to distinguish from the case that
+	 * driver still has completions to handle.
+	 */
+	if (work_done == budget)
+		work_done--;
+
+processing_completed:
+	if (napi_complete_done(napi, work_done))
+		mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
+out:
+	return work_done;
+}
+
+static int mlxsw_pci_napi_poll_cq_tx(struct napi_struct *napi, int budget)
+{
+	struct mlxsw_pci_queue *q = container_of(napi, struct mlxsw_pci_queue,
+						 u.cq.napi);
+	struct mlxsw_pci_queue *sdq = q->u.cq.dq;
+	struct mlxsw_pci *mlxsw_pci = q->pci;
+	int work_done = 0;
+	char *cqe;
+
+	while ((cqe = mlxsw_pci_cq_sw_cqe_get(q))) {
+		u16 wqe_counter = mlxsw_pci_cqe_wqe_counter_get(cqe);
+		u8 sendq = mlxsw_pci_cqe_sr_get(q->u.cq.v, cqe);
+		u8 dqn = mlxsw_pci_cqe_dqn_get(q->u.cq.v, cqe);
+		char ncqe[MLXSW_PCI_CQE_SIZE_MAX];
+
+		if (unlikely(!sendq)) {
+			WARN_ON_ONCE(1);
+			continue;
+		}
+
+		if (unlikely(dqn != sdq->num)) {
+			WARN_ON_ONCE(1);
+			continue;
+		}
+
+		memcpy(ncqe, cqe, q->elem_size);
+		mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
+
+		mlxsw_pci_cqe_sdq_handle(mlxsw_pci, sdq,
+					 wqe_counter, q->u.cq.v, ncqe, budget);
+
+		work_done++;
+	}
+
+	/* If the budget is 0 napi_complete_done() should never be called. */
+	if (unlikely(!budget))
+		goto processing_completed;
+
+	work_done = min(work_done, budget - 1);
+	if (unlikely(!napi_complete_done(napi, work_done)))
+		goto out;
+
+processing_completed:
+	mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
+out:
+	return work_done;
+}
+
+static enum mlxsw_pci_cq_type
+mlxsw_pci_cq_type(const struct mlxsw_pci *mlxsw_pci,
+		  const struct mlxsw_pci_queue *q)
+{
+	/* Each CQ is mapped to one DQ. The first 'num_sdqs' queues are used
+	 * for SDQs and the rest are used for RDQs.
+	 */
+	if (q->num < mlxsw_pci->num_sdqs)
+		return MLXSW_PCI_CQ_SDQ;
+
+	return MLXSW_PCI_CQ_RDQ;
+}
+
+static void mlxsw_pci_cq_napi_setup(struct mlxsw_pci_queue *q,
+				    enum mlxsw_pci_cq_type cq_type)
+{
+	struct mlxsw_pci *mlxsw_pci = q->pci;
+
+	switch (cq_type) {
+	case MLXSW_PCI_CQ_SDQ:
+		netif_napi_add(mlxsw_pci->napi_dev_tx, &q->u.cq.napi,
+			       mlxsw_pci_napi_poll_cq_tx);
+		break;
+	case MLXSW_PCI_CQ_RDQ:
+		netif_napi_add(mlxsw_pci->napi_dev_rx, &q->u.cq.napi,
+			       mlxsw_pci_napi_poll_cq_rx);
+		break;
+	}
+}
+
+static void mlxsw_pci_cq_napi_teardown(struct mlxsw_pci_queue *q)
+{
+	netif_napi_del(&q->u.cq.napi);
+}
+
+static int mlxsw_pci_cq_page_pool_init(struct mlxsw_pci_queue *q,
+				       enum mlxsw_pci_cq_type cq_type)
+{
+	struct page_pool_params pp_params = {};
+	struct mlxsw_pci *mlxsw_pci = q->pci;
+	struct page_pool *page_pool;
+
+	if (cq_type != MLXSW_PCI_CQ_RDQ)
+		return 0;
+
+	pp_params.flags = PP_FLAG_DMA_MAP;
+	pp_params.pool_size = MLXSW_PCI_WQE_COUNT * mlxsw_pci->num_sg_entries;
+	pp_params.nid = dev_to_node(&mlxsw_pci->pdev->dev);
+	pp_params.dev = &mlxsw_pci->pdev->dev;
+	pp_params.napi = &q->u.cq.napi;
+	pp_params.dma_dir = DMA_FROM_DEVICE;
+
+	page_pool = page_pool_create(&pp_params);
+	if (IS_ERR(page_pool))
+		return PTR_ERR(page_pool);
+
+	q->u.cq.page_pool = page_pool;
 	return 0;
+}
+
+static void mlxsw_pci_cq_page_pool_fini(struct mlxsw_pci_queue *q,
+					enum mlxsw_pci_cq_type cq_type)
+{
+	if (cq_type != MLXSW_PCI_CQ_RDQ)
+		return;
+
+	page_pool_destroy(q->u.cq.page_pool);
 }
 
 static int mlxsw_pci_cq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 			     struct mlxsw_pci_queue *q)
 {
+	enum mlxsw_pci_cq_type cq_type = mlxsw_pci_cq_type(mlxsw_pci, q);
 	int i;
 	int err;
 
@@ -587,12 +1024,17 @@ static int mlxsw_pci_cq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	for (i = 0; i < q->count; i++) {
 		char *elem = mlxsw_pci_queue_elem_get(q, i);
 
-		mlxsw_pci_cqe_owner_set(elem, 1);
+		mlxsw_pci_cqe_owner_set(q->u.cq.v, elem, 1);
 	}
 
-	mlxsw_cmd_mbox_sw2hw_cq_cv_set(mbox, 0); /* CQE ver 0 */
+	if (q->u.cq.v == MLXSW_PCI_CQE_V1)
+		mlxsw_cmd_mbox_sw2hw_cq_cqe_ver_set(mbox,
+				MLXSW_CMD_MBOX_SW2HW_CQ_CQE_VER_1);
+	else if (q->u.cq.v == MLXSW_PCI_CQE_V2)
+		mlxsw_cmd_mbox_sw2hw_cq_cqe_ver_set(mbox,
+				MLXSW_CMD_MBOX_SW2HW_CQ_CQE_VER_2);
+
 	mlxsw_cmd_mbox_sw2hw_cq_c_eqn_set(mbox, MLXSW_PCI_EQ_COMP_NUM);
-	mlxsw_cmd_mbox_sw2hw_cq_oi_set(mbox, 0);
 	mlxsw_cmd_mbox_sw2hw_cq_st_set(mbox, 0);
 	mlxsw_cmd_mbox_sw2hw_cq_log_cq_size_set(mbox, ilog2(q->count));
 	for (i = 0; i < MLXSW_PCI_AQ_PAGES; i++) {
@@ -603,153 +1045,91 @@ static int mlxsw_pci_cq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	err = mlxsw_cmd_sw2hw_cq(mlxsw_pci->core, mbox, q->num);
 	if (err)
 		return err;
+	mlxsw_pci_cq_napi_setup(q, cq_type);
+
+	err = mlxsw_pci_cq_page_pool_init(q, cq_type);
+	if (err)
+		goto err_page_pool_init;
+
+	napi_enable(&q->u.cq.napi);
 	mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
 	mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
 	return 0;
+
+err_page_pool_init:
+	mlxsw_pci_cq_napi_teardown(q);
+	return err;
 }
 
 static void mlxsw_pci_cq_fini(struct mlxsw_pci *mlxsw_pci,
 			      struct mlxsw_pci_queue *q)
 {
+	enum mlxsw_pci_cq_type cq_type = mlxsw_pci_cq_type(mlxsw_pci, q);
+
+	napi_disable(&q->u.cq.napi);
+	mlxsw_pci_cq_page_pool_fini(q, cq_type);
+	mlxsw_pci_cq_napi_teardown(q);
 	mlxsw_cmd_hw2sw_cq(mlxsw_pci->core, q->num);
 }
 
-static int mlxsw_pci_cq_dbg_read(struct seq_file *file, void *data)
+static u16 mlxsw_pci_cq_elem_count(const struct mlxsw_pci_queue *q)
 {
-	struct mlxsw_pci *mlxsw_pci = dev_get_drvdata(file->private);
-
-	struct mlxsw_pci_queue *q;
-	int i;
-	static const char hdr[] =
-		"NUM CONS_INDEX  SDQ_COUNT  RDQ_COUNT COUNT\n";
-
-	seq_printf(file, hdr);
-	for (i = 0; i < mlxsw_pci_cq_count(mlxsw_pci); i++) {
-		q = mlxsw_pci_cq_get(mlxsw_pci, i);
-		spin_lock_bh(&q->lock);
-		seq_printf(file, "%3d %10d %10d %10d %5d\n",
-			   i, q->consumer_counter, q->u.cq.comp_sdq_count,
-			   q->u.cq.comp_rdq_count, q->count);
-		spin_unlock_bh(&q->lock);
-	}
-	return 0;
+	return q->u.cq.v == MLXSW_PCI_CQE_V2 ? MLXSW_PCI_CQE2_COUNT :
+					     MLXSW_PCI_CQE01_COUNT;
 }
 
-static void mlxsw_pci_cqe_sdq_handle(struct mlxsw_pci *mlxsw_pci,
-				     struct mlxsw_pci_queue *q,
-				     u16 consumer_counter_limit,
-				     char *cqe)
+static u8 mlxsw_pci_cq_elem_size(const struct mlxsw_pci_queue *q)
 {
-	struct pci_dev *pdev = mlxsw_pci->pdev;
-	struct mlxsw_pci_queue_elem_info *elem_info;
-	char *wqe;
-	struct sk_buff *skb;
-	int i;
-
-	spin_lock(&q->lock);
-	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
-	skb = elem_info->u.sdq.skb;
-	wqe = elem_info->elem;
-	for (i = 0; i < MLXSW_PCI_WQE_SG_ENTRIES; i++)
-		mlxsw_pci_wqe_frag_unmap(mlxsw_pci, wqe, i, DMA_TO_DEVICE);
-	dev_kfree_skb_any(skb);
-	elem_info->u.sdq.skb = NULL;
-
-	if (q->consumer_counter++ != consumer_counter_limit)
-		dev_dbg_ratelimited(&pdev->dev, "Consumer counter does not match limit in SDQ\n");
-	spin_unlock(&q->lock);
+	return q->u.cq.v == MLXSW_PCI_CQE_V2 ? MLXSW_PCI_CQE2_SIZE :
+					       MLXSW_PCI_CQE01_SIZE;
 }
 
-static void mlxsw_pci_cqe_rdq_handle(struct mlxsw_pci *mlxsw_pci,
-				     struct mlxsw_pci_queue *q,
-				     u16 consumer_counter_limit,
-				     char *cqe)
+static char *mlxsw_pci_eq_sw_eqe_get(struct mlxsw_pci_queue *q)
 {
-	struct pci_dev *pdev = mlxsw_pci->pdev;
 	struct mlxsw_pci_queue_elem_info *elem_info;
-	char *wqe;
-	struct sk_buff *skb;
-	struct mlxsw_rx_info rx_info;
-	u16 byte_count;
-	int err;
+	char *elem;
+	bool owner_bit;
 
 	elem_info = mlxsw_pci_queue_elem_info_consumer_get(q);
-	skb = elem_info->u.sdq.skb;
-	if (!skb)
-		return;
-	wqe = elem_info->elem;
-	mlxsw_pci_wqe_frag_unmap(mlxsw_pci, wqe, 0, DMA_FROM_DEVICE);
-
-	if (q->consumer_counter++ != consumer_counter_limit)
-		dev_dbg_ratelimited(&pdev->dev, "Consumer counter does not match limit in RDQ\n");
-
-	/* We do not support lag now */
-	if (mlxsw_pci_cqe_lag_get(cqe))
-		goto drop;
-
-	rx_info.sys_port = mlxsw_pci_cqe_system_port_get(cqe);
-	rx_info.trap_id = mlxsw_pci_cqe_trap_id_get(cqe);
-
-	byte_count = mlxsw_pci_cqe_byte_count_get(cqe);
-	if (mlxsw_pci_cqe_crc_get(cqe))
-		byte_count -= ETH_FCS_LEN;
-	skb_put(skb, byte_count);
-	mlxsw_core_skb_receive(mlxsw_pci->core, skb, &rx_info);
-
-put_new_skb:
-	memset(wqe, 0, q->elem_size);
-	err = mlxsw_pci_rdq_skb_alloc(mlxsw_pci, elem_info);
-	if (err && net_ratelimit())
-		dev_dbg(&pdev->dev, "Failed to alloc skb for RDQ\n");
-	/* Everything is set up, ring doorbell to pass elem to HW */
-	q->producer_counter++;
-	mlxsw_pci_queue_doorbell_producer_ring(mlxsw_pci, q);
-	return;
-
-drop:
-	dev_kfree_skb_any(skb);
-	goto put_new_skb;
+	elem = elem_info->elem;
+	owner_bit = mlxsw_pci_eqe_owner_get(elem);
+	if (mlxsw_pci_elem_hw_owned(q, owner_bit))
+		return NULL;
+	q->consumer_counter++;
+	rmb(); /* make sure we read owned bit before the rest of elem */
+	return elem;
 }
 
-static char *mlxsw_pci_cq_sw_cqe_get(struct mlxsw_pci_queue *q)
+static void mlxsw_pci_eq_tasklet(struct tasklet_struct *t)
 {
-	return mlxsw_pci_queue_sw_elem_get(q, mlxsw_pci_cqe_owner_get);
-}
-
-static void mlxsw_pci_cq_tasklet(unsigned long data)
-{
-	struct mlxsw_pci_queue *q = (struct mlxsw_pci_queue *) data;
+	unsigned long active_cqns[BITS_TO_LONGS(MLXSW_PCI_CQS_MAX)];
+	struct mlxsw_pci_queue *q = from_tasklet(q, t, u.eq.tasklet);
 	struct mlxsw_pci *mlxsw_pci = q->pci;
-	char *cqe;
-	int items = 0;
 	int credits = q->count >> 1;
+	u8 cqn, cq_count;
+	int items = 0;
+	char *eqe;
 
-	while ((cqe = mlxsw_pci_cq_sw_cqe_get(q))) {
-		u16 wqe_counter = mlxsw_pci_cqe_wqe_counter_get(cqe);
-		u8 sendq = mlxsw_pci_cqe_sr_get(cqe);
-		u8 dqn = mlxsw_pci_cqe_dqn_get(cqe);
+	memset(&active_cqns, 0, sizeof(active_cqns));
 
-		if (sendq) {
-			struct mlxsw_pci_queue *sdq;
+	while ((eqe = mlxsw_pci_eq_sw_eqe_get(q))) {
+		cqn = mlxsw_pci_eqe_cqn_get(eqe);
+		set_bit(cqn, active_cqns);
 
-			sdq = mlxsw_pci_sdq_get(mlxsw_pci, dqn);
-			mlxsw_pci_cqe_sdq_handle(mlxsw_pci, sdq,
-						 wqe_counter, cqe);
-			q->u.cq.comp_sdq_count++;
-		} else {
-			struct mlxsw_pci_queue *rdq;
-
-			rdq = mlxsw_pci_rdq_get(mlxsw_pci, dqn);
-			mlxsw_pci_cqe_rdq_handle(mlxsw_pci, rdq,
-						 wqe_counter, cqe);
-			q->u.cq.comp_rdq_count++;
-		}
 		if (++items == credits)
 			break;
 	}
-	if (items) {
-		mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
-		mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
+
+	if (!items)
+		return;
+
+	mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
+	mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
+
+	cq_count = mlxsw_pci->num_cqs;
+	for_each_set_bit(cqn, active_cqns, cq_count) {
+		q = mlxsw_pci_cq_get(mlxsw_pci, cqn);
+		napi_schedule(&q->u.cq.napi);
 	}
 }
 
@@ -758,6 +1138,13 @@ static int mlxsw_pci_eq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 {
 	int i;
 	int err;
+
+	/* We expect to initialize only one EQ, which gets num=0 as it is
+	 * located at index zero. We use the EQ as EQ1, so set the number for
+	 * future use.
+	 */
+	WARN_ON_ONCE(q->num);
+	q->num = MLXSW_PCI_EQ_COMP_NUM;
 
 	q->consumer_counter = 0;
 
@@ -768,7 +1155,6 @@ static int mlxsw_pci_eq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	}
 
 	mlxsw_cmd_mbox_sw2hw_eq_int_msix_set(mbox, 1); /* MSI-X used */
-	mlxsw_cmd_mbox_sw2hw_eq_oi_set(mbox, 0);
 	mlxsw_cmd_mbox_sw2hw_eq_st_set(mbox, 1); /* armed */
 	mlxsw_cmd_mbox_sw2hw_eq_log_eq_size_set(mbox, ilog2(q->count));
 	for (i = 0; i < MLXSW_PCI_AQ_PAGES; i++) {
@@ -779,6 +1165,7 @@ static int mlxsw_pci_eq_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	err = mlxsw_cmd_sw2hw_eq(mlxsw_pci->core, mbox, q->num);
 	if (err)
 		return err;
+	tasklet_setup(&q->u.eq.tasklet, mlxsw_pci_eq_tasklet);
 	mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
 	mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
 	return 0;
@@ -790,97 +1177,17 @@ static void mlxsw_pci_eq_fini(struct mlxsw_pci *mlxsw_pci,
 	mlxsw_cmd_hw2sw_eq(mlxsw_pci->core, q->num);
 }
 
-static int mlxsw_pci_eq_dbg_read(struct seq_file *file, void *data)
-{
-	struct mlxsw_pci *mlxsw_pci = dev_get_drvdata(file->private);
-	struct mlxsw_pci_queue *q;
-	int i;
-	static const char hdr[] =
-		"NUM CONS_COUNT     EV_CMD    EV_COMP   EV_OTHER COUNT\n";
-
-	seq_printf(file, hdr);
-	for (i = 0; i < mlxsw_pci_eq_count(mlxsw_pci); i++) {
-		q = mlxsw_pci_eq_get(mlxsw_pci, i);
-		spin_lock_bh(&q->lock);
-		seq_printf(file, "%3d %10d %10d %10d %10d %5d\n",
-			   i, q->consumer_counter, q->u.eq.ev_cmd_count,
-			   q->u.eq.ev_comp_count, q->u.eq.ev_other_count,
-			   q->count);
-		spin_unlock_bh(&q->lock);
-	}
-	return 0;
-}
-
-static void mlxsw_pci_eq_cmd_event(struct mlxsw_pci *mlxsw_pci, char *eqe)
-{
-	mlxsw_pci->cmd.comp.status = mlxsw_pci_eqe_cmd_status_get(eqe);
-	mlxsw_pci->cmd.comp.out_param =
-		((u64) mlxsw_pci_eqe_cmd_out_param_h_get(eqe)) << 32 |
-		mlxsw_pci_eqe_cmd_out_param_l_get(eqe);
-	mlxsw_pci->cmd.wait_done = true;
-	wake_up(&mlxsw_pci->cmd.wait);
-}
-
-static char *mlxsw_pci_eq_sw_eqe_get(struct mlxsw_pci_queue *q)
-{
-	return mlxsw_pci_queue_sw_elem_get(q, mlxsw_pci_eqe_owner_get);
-}
-
-static void mlxsw_pci_eq_tasklet(unsigned long data)
-{
-	struct mlxsw_pci_queue *q = (struct mlxsw_pci_queue *) data;
-	struct mlxsw_pci *mlxsw_pci = q->pci;
-	unsigned long active_cqns[BITS_TO_LONGS(MLXSW_PCI_CQS_COUNT)];
-	char *eqe;
-	u8 cqn;
-	bool cq_handle = false;
-	int items = 0;
-	int credits = q->count >> 1;
-
-	memset(&active_cqns, 0, sizeof(active_cqns));
-
-	while ((eqe = mlxsw_pci_eq_sw_eqe_get(q))) {
-		u8 event_type = mlxsw_pci_eqe_event_type_get(eqe);
-
-		switch (event_type) {
-		case MLXSW_PCI_EQE_EVENT_TYPE_CMD:
-			mlxsw_pci_eq_cmd_event(mlxsw_pci, eqe);
-			q->u.eq.ev_cmd_count++;
-			break;
-		case MLXSW_PCI_EQE_EVENT_TYPE_COMP:
-			cqn = mlxsw_pci_eqe_cqn_get(eqe);
-			set_bit(cqn, active_cqns);
-			cq_handle = true;
-			q->u.eq.ev_comp_count++;
-			break;
-		default:
-			q->u.eq.ev_other_count++;
-		}
-		if (++items == credits)
-			break;
-	}
-	if (items) {
-		mlxsw_pci_queue_doorbell_consumer_ring(mlxsw_pci, q);
-		mlxsw_pci_queue_doorbell_arm_consumer_ring(mlxsw_pci, q);
-	}
-
-	if (!cq_handle)
-		return;
-	for_each_set_bit(cqn, active_cqns, MLXSW_PCI_CQS_COUNT) {
-		q = mlxsw_pci_cq_get(mlxsw_pci, cqn);
-		mlxsw_pci_queue_tasklet_schedule(q);
-	}
-}
-
 struct mlxsw_pci_queue_ops {
 	const char *name;
 	enum mlxsw_pci_queue_type type;
+	void (*pre_init)(struct mlxsw_pci *mlxsw_pci,
+			 struct mlxsw_pci_queue *q);
 	int (*init)(struct mlxsw_pci *mlxsw_pci, char *mbox,
 		    struct mlxsw_pci_queue *q);
 	void (*fini)(struct mlxsw_pci *mlxsw_pci,
 		     struct mlxsw_pci_queue *q);
-	void (*tasklet)(unsigned long data);
-	int (*dbg_read)(struct seq_file *s, void *data);
+	u16 (*elem_count_f)(const struct mlxsw_pci_queue *q);
+	u8 (*elem_size_f)(const struct mlxsw_pci_queue *q);
 	u16 elem_count;
 	u8 elem_size;
 };
@@ -889,7 +1196,6 @@ static const struct mlxsw_pci_queue_ops mlxsw_pci_sdq_ops = {
 	.type		= MLXSW_PCI_QUEUE_TYPE_SDQ,
 	.init		= mlxsw_pci_sdq_init,
 	.fini		= mlxsw_pci_sdq_fini,
-	.dbg_read	= mlxsw_pci_sdq_dbg_read,
 	.elem_count	= MLXSW_PCI_WQE_COUNT,
 	.elem_size	= MLXSW_PCI_WQE_SIZE,
 };
@@ -898,27 +1204,23 @@ static const struct mlxsw_pci_queue_ops mlxsw_pci_rdq_ops = {
 	.type		= MLXSW_PCI_QUEUE_TYPE_RDQ,
 	.init		= mlxsw_pci_rdq_init,
 	.fini		= mlxsw_pci_rdq_fini,
-	.dbg_read	= mlxsw_pci_rdq_dbg_read,
 	.elem_count	= MLXSW_PCI_WQE_COUNT,
 	.elem_size	= MLXSW_PCI_WQE_SIZE
 };
 
 static const struct mlxsw_pci_queue_ops mlxsw_pci_cq_ops = {
 	.type		= MLXSW_PCI_QUEUE_TYPE_CQ,
+	.pre_init	= mlxsw_pci_cq_pre_init,
 	.init		= mlxsw_pci_cq_init,
 	.fini		= mlxsw_pci_cq_fini,
-	.tasklet	= mlxsw_pci_cq_tasklet,
-	.dbg_read	= mlxsw_pci_cq_dbg_read,
-	.elem_count	= MLXSW_PCI_CQE_COUNT,
-	.elem_size	= MLXSW_PCI_CQE_SIZE
+	.elem_count_f	= mlxsw_pci_cq_elem_count,
+	.elem_size_f	= mlxsw_pci_cq_elem_size
 };
 
 static const struct mlxsw_pci_queue_ops mlxsw_pci_eq_ops = {
 	.type		= MLXSW_PCI_QUEUE_TYPE_EQ,
 	.init		= mlxsw_pci_eq_init,
 	.fini		= mlxsw_pci_eq_fini,
-	.tasklet	= mlxsw_pci_eq_tasklet,
-	.dbg_read	= mlxsw_pci_eq_dbg_read,
 	.elem_count	= MLXSW_PCI_EQE_COUNT,
 	.elem_size	= MLXSW_PCI_EQE_SIZE
 };
@@ -931,23 +1233,24 @@ static int mlxsw_pci_queue_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 	int i;
 	int err;
 
-	spin_lock_init(&q->lock);
 	q->num = q_num;
-	q->count = q_ops->elem_count;
-	q->elem_size = q_ops->elem_size;
+	if (q_ops->pre_init)
+		q_ops->pre_init(mlxsw_pci, q);
+
+	spin_lock_init(&q->lock);
+	q->count = q_ops->elem_count_f ? q_ops->elem_count_f(q) :
+					 q_ops->elem_count;
+	q->elem_size = q_ops->elem_size_f ? q_ops->elem_size_f(q) :
+					    q_ops->elem_size;
 	q->type = q_ops->type;
 	q->pci = mlxsw_pci;
 
-	if (q_ops->tasklet)
-		tasklet_init(&q->tasklet, q_ops->tasklet, (unsigned long) q);
-
 	mem_item->size = MLXSW_PCI_AQ_SIZE;
-	mem_item->buf = pci_alloc_consistent(mlxsw_pci->pdev,
-					     mem_item->size,
-					     &mem_item->mapaddr);
+	mem_item->buf = dma_alloc_coherent(&mlxsw_pci->pdev->dev,
+					   mem_item->size, &mem_item->mapaddr,
+					   GFP_KERNEL);
 	if (!mem_item->buf)
 		return -ENOMEM;
-	memset(mem_item->buf, 0, mem_item->size);
 
 	q->elem_info = kcalloc(q->count, sizeof(*q->elem_info), GFP_KERNEL);
 	if (!q->elem_info) {
@@ -963,7 +1266,7 @@ static int mlxsw_pci_queue_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 
 		elem_info = mlxsw_pci_queue_elem_info_get(q, i);
 		elem_info->elem =
-			__mlxsw_pci_queue_elem_get(q, q_ops->elem_size, i);
+			__mlxsw_pci_queue_elem_get(q, q->elem_size, i);
 	}
 
 	mlxsw_cmd_mbox_zero(mbox);
@@ -975,8 +1278,8 @@ static int mlxsw_pci_queue_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 err_q_ops_init:
 	kfree(q->elem_info);
 err_elem_info_alloc:
-	pci_free_consistent(mlxsw_pci->pdev, mem_item->size,
-			    mem_item->buf, mem_item->mapaddr);
+	dma_free_coherent(&mlxsw_pci->pdev->dev, mem_item->size,
+			  mem_item->buf, mem_item->mapaddr);
 	return err;
 }
 
@@ -988,17 +1291,15 @@ static void mlxsw_pci_queue_fini(struct mlxsw_pci *mlxsw_pci,
 
 	q_ops->fini(mlxsw_pci, q);
 	kfree(q->elem_info);
-	pci_free_consistent(mlxsw_pci->pdev, mem_item->size,
-			    mem_item->buf, mem_item->mapaddr);
+	dma_free_coherent(&mlxsw_pci->pdev->dev, mem_item->size,
+			  mem_item->buf, mem_item->mapaddr);
 }
 
 static int mlxsw_pci_queue_group_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 				      const struct mlxsw_pci_queue_ops *q_ops,
 				      u8 num_qs)
 {
-	struct pci_dev *pdev = mlxsw_pci->pdev;
 	struct mlxsw_pci_queue_type_group *queue_group;
-	char tmp[16];
 	int i;
 	int err;
 
@@ -1014,10 +1315,6 @@ static int mlxsw_pci_queue_group_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 			goto err_queue_init;
 	}
 	queue_group->count = num_qs;
-
-	sprintf(tmp, "%s_stats", mlxsw_pci_queue_type_str(q_ops->type));
-	debugfs_create_devm_seqfile(&pdev->dev, tmp, mlxsw_pci->dbg_dir,
-				    q_ops->dbg_read);
 
 	return 0;
 
@@ -1049,6 +1346,7 @@ static int mlxsw_pci_aqs_init(struct mlxsw_pci *mlxsw_pci, char *mbox)
 	u8 rdq_log2sz;
 	u8 num_cqs;
 	u8 cq_log2sz;
+	u8 cqv2_log2sz;
 	u8 num_eqs;
 	u8 eq_log2sz;
 	int err;
@@ -1064,27 +1362,32 @@ static int mlxsw_pci_aqs_init(struct mlxsw_pci *mlxsw_pci, char *mbox)
 	rdq_log2sz = mlxsw_cmd_mbox_query_aq_cap_log_max_rdq_sz_get(mbox);
 	num_cqs = mlxsw_cmd_mbox_query_aq_cap_max_num_cqs_get(mbox);
 	cq_log2sz = mlxsw_cmd_mbox_query_aq_cap_log_max_cq_sz_get(mbox);
+	cqv2_log2sz = mlxsw_cmd_mbox_query_aq_cap_log_max_cqv2_sz_get(mbox);
 	num_eqs = mlxsw_cmd_mbox_query_aq_cap_max_num_eqs_get(mbox);
 	eq_log2sz = mlxsw_cmd_mbox_query_aq_cap_log_max_eq_sz_get(mbox);
 
-	if ((num_sdqs != MLXSW_PCI_SDQS_COUNT) ||
-	    (num_rdqs != MLXSW_PCI_RDQS_COUNT) ||
-	    (num_cqs != MLXSW_PCI_CQS_COUNT) ||
-	    (num_eqs != MLXSW_PCI_EQS_COUNT)) {
+	if (num_sdqs + num_rdqs > num_cqs ||
+	    num_sdqs < MLXSW_PCI_SDQS_MIN ||
+	    num_cqs > MLXSW_PCI_CQS_MAX || num_eqs != MLXSW_PCI_EQS_MAX) {
 		dev_err(&pdev->dev, "Unsupported number of queues\n");
 		return -EINVAL;
 	}
 
 	if ((1 << sdq_log2sz != MLXSW_PCI_WQE_COUNT) ||
 	    (1 << rdq_log2sz != MLXSW_PCI_WQE_COUNT) ||
-	    (1 << cq_log2sz != MLXSW_PCI_CQE_COUNT) ||
+	    (1 << cq_log2sz != MLXSW_PCI_CQE01_COUNT) ||
+	    (mlxsw_pci->max_cqe_ver == MLXSW_PCI_CQE_V2 &&
+	     (1 << cqv2_log2sz != MLXSW_PCI_CQE2_COUNT)) ||
 	    (1 << eq_log2sz != MLXSW_PCI_EQE_COUNT)) {
 		dev_err(&pdev->dev, "Unsupported number of async queue descriptors\n");
 		return -EINVAL;
 	}
 
+	mlxsw_pci->num_cqs = num_cqs;
+	mlxsw_pci->num_sdqs = num_sdqs;
+
 	err = mlxsw_pci_queue_group_init(mlxsw_pci, mbox, &mlxsw_pci_eq_ops,
-					 num_eqs);
+					 MLXSW_PCI_EQS_COUNT);
 	if (err) {
 		dev_err(&pdev->dev, "Failed to initialize event queues\n");
 		return err;
@@ -1111,8 +1414,6 @@ static int mlxsw_pci_aqs_init(struct mlxsw_pci *mlxsw_pci, char *mbox)
 		goto err_rdqs_init;
 	}
 
-	/* We have to poll in command interface until queues are initialized */
-	mlxsw_pci->cmd.nopoll = true;
 	return 0;
 
 err_rdqs_init:
@@ -1126,7 +1427,6 @@ err_cqs_init:
 
 static void mlxsw_pci_aqs_fini(struct mlxsw_pci *mlxsw_pci)
 {
-	mlxsw_pci->cmd.nopoll = false;
 	mlxsw_pci_queue_group_fini(mlxsw_pci, &mlxsw_pci_rdq_ops);
 	mlxsw_pci_queue_group_fini(mlxsw_pci, &mlxsw_pci_sdq_ops);
 	mlxsw_pci_queue_group_fini(mlxsw_pci, &mlxsw_pci_cq_ops);
@@ -1153,10 +1453,33 @@ mlxsw_pci_config_profile_swid_config(struct mlxsw_pci *mlxsw_pci,
 	mlxsw_cmd_mbox_config_profile_swid_config_mask_set(mbox, index, mask);
 }
 
+static int
+mlxsw_pci_profile_get_kvd_sizes(const struct mlxsw_pci *mlxsw_pci,
+				const struct mlxsw_config_profile *profile,
+				struct mlxsw_res *res)
+{
+	u64 single_size, double_size, linear_size;
+	int err;
+
+	err = mlxsw_core_kvd_sizes_get(mlxsw_pci->core, profile,
+				       &single_size, &double_size,
+				       &linear_size);
+	if (err)
+		return err;
+
+	MLXSW_RES_SET(res, KVD_SINGLE_SIZE, single_size);
+	MLXSW_RES_SET(res, KVD_DOUBLE_SIZE, double_size);
+	MLXSW_RES_SET(res, KVD_LINEAR_SIZE, linear_size);
+
+	return 0;
+}
+
 static int mlxsw_pci_config_profile(struct mlxsw_pci *mlxsw_pci, char *mbox,
-				    const struct mlxsw_config_profile *profile)
+				    const struct mlxsw_config_profile *profile,
+				    struct mlxsw_res *res)
 {
 	int i;
+	int err;
 
 	mlxsw_cmd_mbox_zero(mbox);
 
@@ -1167,16 +1490,9 @@ static int mlxsw_pci_config_profile(struct mlxsw_pci *mlxsw_pci, char *mbox,
 			mbox, profile->max_vepa_channels);
 	}
 	if (profile->used_max_lag) {
-		mlxsw_cmd_mbox_config_profile_set_max_lag_set(
-			mbox, 1);
-		mlxsw_cmd_mbox_config_profile_max_lag_set(
-			mbox, profile->max_lag);
-	}
-	if (profile->used_max_port_per_lag) {
-		mlxsw_cmd_mbox_config_profile_set_max_port_per_lag_set(
-			mbox, 1);
-		mlxsw_cmd_mbox_config_profile_max_port_per_lag_set(
-			mbox, profile->max_port_per_lag);
+		mlxsw_cmd_mbox_config_profile_set_max_lag_set(mbox, 1);
+		mlxsw_cmd_mbox_config_profile_max_lag_set(mbox,
+							  profile->max_lag);
 	}
 	if (profile->used_max_mid) {
 		mlxsw_cmd_mbox_config_profile_set_max_mid_set(
@@ -1215,12 +1531,31 @@ static int mlxsw_pci_config_profile(struct mlxsw_pci *mlxsw_pci, char *mbox,
 			mbox, profile->max_flood_tables);
 		mlxsw_cmd_mbox_config_profile_max_vid_flood_tables_set(
 			mbox, profile->max_vid_flood_tables);
+		mlxsw_cmd_mbox_config_profile_max_fid_offset_flood_tables_set(
+			mbox, profile->max_fid_offset_flood_tables);
+		mlxsw_cmd_mbox_config_profile_fid_offset_flood_table_size_set(
+			mbox, profile->fid_offset_flood_table_size);
+		mlxsw_cmd_mbox_config_profile_max_fid_flood_tables_set(
+			mbox, profile->max_fid_flood_tables);
+		mlxsw_cmd_mbox_config_profile_fid_flood_table_size_set(
+			mbox, profile->fid_flood_table_size);
 	}
-	if (profile->used_flood_mode) {
+	if (profile->flood_mode_prefer_cff && mlxsw_pci->cff_support) {
+		enum mlxsw_cmd_mbox_config_profile_flood_mode flood_mode =
+			MLXSW_CMD_MBOX_CONFIG_PROFILE_FLOOD_MODE_CFF;
+
+		mlxsw_cmd_mbox_config_profile_set_flood_mode_set(mbox, 1);
+		mlxsw_cmd_mbox_config_profile_flood_mode_set(mbox, flood_mode);
+		mlxsw_pci->flood_mode = flood_mode;
+	} else if (profile->used_flood_mode) {
 		mlxsw_cmd_mbox_config_profile_set_flood_mode_set(
 			mbox, 1);
 		mlxsw_cmd_mbox_config_profile_flood_mode_set(
 			mbox, profile->flood_mode);
+		mlxsw_pci->flood_mode = profile->flood_mode;
+	} else {
+		WARN_ON(1);
+		return -EINVAL;
 	}
 	if (profile->used_max_ib_mc) {
 		mlxsw_cmd_mbox_config_profile_set_max_ib_mc_set(
@@ -1246,11 +1581,55 @@ static int mlxsw_pci_config_profile(struct mlxsw_pci *mlxsw_pci, char *mbox,
 		mlxsw_cmd_mbox_config_profile_adaptive_routing_group_cap_set(
 			mbox, profile->adaptive_routing_group_cap);
 	}
+	if (profile->used_ubridge) {
+		mlxsw_cmd_mbox_config_profile_set_ubridge_set(mbox, 1);
+		mlxsw_cmd_mbox_config_profile_ubridge_set(mbox,
+							  profile->ubridge);
+	}
+	if (profile->used_kvd_sizes && MLXSW_RES_VALID(res, KVD_SIZE)) {
+		err = mlxsw_pci_profile_get_kvd_sizes(mlxsw_pci, profile, res);
+		if (err)
+			return err;
+
+		mlxsw_cmd_mbox_config_profile_set_kvd_linear_size_set(mbox, 1);
+		mlxsw_cmd_mbox_config_profile_kvd_linear_size_set(mbox,
+					MLXSW_RES_GET(res, KVD_LINEAR_SIZE));
+		mlxsw_cmd_mbox_config_profile_set_kvd_hash_single_size_set(mbox,
+									   1);
+		mlxsw_cmd_mbox_config_profile_kvd_hash_single_size_set(mbox,
+					MLXSW_RES_GET(res, KVD_SINGLE_SIZE));
+		mlxsw_cmd_mbox_config_profile_set_kvd_hash_double_size_set(
+								mbox, 1);
+		mlxsw_cmd_mbox_config_profile_kvd_hash_double_size_set(mbox,
+					MLXSW_RES_GET(res, KVD_DOUBLE_SIZE));
+	}
 
 	for (i = 0; i < MLXSW_CONFIG_PROFILE_SWID_COUNT; i++)
 		mlxsw_pci_config_profile_swid_config(mlxsw_pci, mbox, i,
 						     &profile->swid_config[i]);
 
+	if (mlxsw_pci->max_cqe_ver > MLXSW_PCI_CQE_V0) {
+		mlxsw_cmd_mbox_config_profile_set_cqe_version_set(mbox, 1);
+		mlxsw_cmd_mbox_config_profile_cqe_version_set(mbox, 1);
+	}
+
+	if (profile->used_cqe_time_stamp_type) {
+		mlxsw_cmd_mbox_config_profile_set_cqe_time_stamp_type_set(mbox,
+									  1);
+		mlxsw_cmd_mbox_config_profile_cqe_time_stamp_type_set(mbox,
+					profile->cqe_time_stamp_type);
+	}
+
+	if (profile->lag_mode_prefer_sw && mlxsw_pci->lag_mode_support) {
+		enum mlxsw_cmd_mbox_config_profile_lag_mode lag_mode =
+			MLXSW_CMD_MBOX_CONFIG_PROFILE_LAG_MODE_SW;
+
+		mlxsw_cmd_mbox_config_profile_set_lag_mode_set(mbox, 1);
+		mlxsw_cmd_mbox_config_profile_lag_mode_set(mbox, lag_mode);
+		mlxsw_pci->lag_mode = lag_mode;
+	} else {
+		mlxsw_pci->lag_mode = MLXSW_CMD_MBOX_CONFIG_PROFILE_LAG_MODE_FW;
+	}
 	return mlxsw_cmd_config_profile_set(mlxsw_pci->core, mbox);
 }
 
@@ -1272,6 +1651,7 @@ static int mlxsw_pci_fw_area_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 				  u16 num_pages)
 {
 	struct mlxsw_pci_mem_item *mem_item;
+	int nent = 0;
 	int i;
 	int err;
 
@@ -1279,27 +1659,36 @@ static int mlxsw_pci_fw_area_init(struct mlxsw_pci *mlxsw_pci, char *mbox,
 					   GFP_KERNEL);
 	if (!mlxsw_pci->fw_area.items)
 		return -ENOMEM;
-	mlxsw_pci->fw_area.num_pages = num_pages;
+	mlxsw_pci->fw_area.count = num_pages;
 
 	mlxsw_cmd_mbox_zero(mbox);
 	for (i = 0; i < num_pages; i++) {
 		mem_item = &mlxsw_pci->fw_area.items[i];
 
 		mem_item->size = MLXSW_PCI_PAGE_SIZE;
-		mem_item->buf = pci_alloc_consistent(mlxsw_pci->pdev,
-						     mem_item->size,
-						     &mem_item->mapaddr);
+		mem_item->buf = dma_alloc_coherent(&mlxsw_pci->pdev->dev,
+						   mem_item->size,
+						   &mem_item->mapaddr, GFP_KERNEL);
 		if (!mem_item->buf) {
 			err = -ENOMEM;
 			goto err_alloc;
 		}
-		mlxsw_cmd_mbox_map_fa_pa_set(mbox, i, mem_item->mapaddr);
-		mlxsw_cmd_mbox_map_fa_log2size_set(mbox, i, 0); /* 1 page */
+		mlxsw_cmd_mbox_map_fa_pa_set(mbox, nent, mem_item->mapaddr);
+		mlxsw_cmd_mbox_map_fa_log2size_set(mbox, nent, 0); /* 1 page */
+		if (++nent == MLXSW_CMD_MAP_FA_VPM_ENTRIES_MAX) {
+			err = mlxsw_cmd_map_fa(mlxsw_pci->core, mbox, nent);
+			if (err)
+				goto err_cmd_map_fa;
+			nent = 0;
+			mlxsw_cmd_mbox_zero(mbox);
+		}
 	}
 
-	err = mlxsw_cmd_map_fa(mlxsw_pci->core, mbox, num_pages);
-	if (err)
-		goto err_cmd_map_fa;
+	if (nent) {
+		err = mlxsw_cmd_map_fa(mlxsw_pci->core, mbox, nent);
+		if (err)
+			goto err_cmd_map_fa;
+	}
 
 	return 0;
 
@@ -1308,8 +1697,8 @@ err_alloc:
 	for (i--; i >= 0; i--) {
 		mem_item = &mlxsw_pci->fw_area.items[i];
 
-		pci_free_consistent(mlxsw_pci->pdev, mem_item->size,
-				    mem_item->buf, mem_item->mapaddr);
+		dma_free_coherent(&mlxsw_pci->pdev->dev, mem_item->size,
+				  mem_item->buf, mem_item->mapaddr);
 	}
 	kfree(mlxsw_pci->fw_area.items);
 	return err;
@@ -1322,11 +1711,11 @@ static void mlxsw_pci_fw_area_fini(struct mlxsw_pci *mlxsw_pci)
 
 	mlxsw_cmd_unmap_fa(mlxsw_pci->core);
 
-	for (i = 0; i < mlxsw_pci->fw_area.num_pages; i++) {
+	for (i = 0; i < mlxsw_pci->fw_area.count; i++) {
 		mem_item = &mlxsw_pci->fw_area.items[i];
 
-		pci_free_consistent(mlxsw_pci->pdev, mem_item->size,
-				    mem_item->buf, mem_item->mapaddr);
+		dma_free_coherent(&mlxsw_pci->pdev->dev, mem_item->size,
+				  mem_item->buf, mem_item->mapaddr);
 	}
 	kfree(mlxsw_pci->fw_area.items);
 }
@@ -1335,12 +1724,9 @@ static irqreturn_t mlxsw_pci_eq_irq_handler(int irq, void *dev_id)
 {
 	struct mlxsw_pci *mlxsw_pci = dev_id;
 	struct mlxsw_pci_queue *q;
-	int i;
 
-	for (i = 0; i < MLXSW_PCI_EQS_COUNT; i++) {
-		q = mlxsw_pci_eq_get(mlxsw_pci, i);
-		mlxsw_pci_queue_tasklet_schedule(q);
-	}
+	q = mlxsw_pci_eq_get(mlxsw_pci);
+	tasklet_schedule(&q->u.eq.tasklet);
 	return IRQ_HANDLED;
 }
 
@@ -1351,8 +1737,8 @@ static int mlxsw_pci_mbox_alloc(struct mlxsw_pci *mlxsw_pci,
 	int err = 0;
 
 	mbox->size = MLXSW_CMD_MBOX_SIZE;
-	mbox->buf = pci_alloc_consistent(pdev, MLXSW_CMD_MBOX_SIZE,
-					 &mbox->mapaddr);
+	mbox->buf = dma_alloc_coherent(&pdev->dev, MLXSW_CMD_MBOX_SIZE,
+				       &mbox->mapaddr, GFP_KERNEL);
 	if (!mbox->buf) {
 		dev_err(&pdev->dev, "Failed allocating memory for mailbox\n");
 		err = -ENOMEM;
@@ -1366,12 +1752,162 @@ static void mlxsw_pci_mbox_free(struct mlxsw_pci *mlxsw_pci,
 {
 	struct pci_dev *pdev = mlxsw_pci->pdev;
 
-	pci_free_consistent(pdev, MLXSW_CMD_MBOX_SIZE, mbox->buf,
-			    mbox->mapaddr);
+	dma_free_coherent(&pdev->dev, MLXSW_CMD_MBOX_SIZE, mbox->buf,
+			  mbox->mapaddr);
+}
+
+static int mlxsw_pci_sys_ready_wait(struct mlxsw_pci *mlxsw_pci,
+				    const struct pci_device_id *id,
+				    u32 *p_sys_status)
+{
+	unsigned long end;
+	u32 val;
+
+	/* We must wait for the HW to become responsive. */
+	msleep(MLXSW_PCI_SW_RESET_WAIT_MSECS);
+
+	end = jiffies + msecs_to_jiffies(MLXSW_PCI_SW_RESET_TIMEOUT_MSECS);
+	do {
+		val = mlxsw_pci_read32(mlxsw_pci, FW_READY);
+		if ((val & MLXSW_PCI_FW_READY_MASK) == MLXSW_PCI_FW_READY_MAGIC)
+			return 0;
+		cond_resched();
+	} while (time_before(jiffies, end));
+
+	*p_sys_status = val & MLXSW_PCI_FW_READY_MASK;
+
+	return -EBUSY;
+}
+
+static int mlxsw_pci_reset_at_pci_disable(struct mlxsw_pci *mlxsw_pci,
+					  bool pci_reset_sbr_supported)
+{
+	struct pci_dev *pdev = mlxsw_pci->pdev;
+	char mrsr_pl[MLXSW_REG_MRSR_LEN];
+	struct pci_dev *bridge;
+	int err;
+
+	if (!pci_reset_sbr_supported) {
+		pci_dbg(pdev, "Performing PCI hot reset instead of \"all reset\"\n");
+		goto sbr;
+	}
+
+	mlxsw_reg_mrsr_pack(mrsr_pl,
+			    MLXSW_REG_MRSR_COMMAND_RESET_AT_PCI_DISABLE);
+	err = mlxsw_reg_write(mlxsw_pci->core, MLXSW_REG(mrsr), mrsr_pl);
+	if (err)
+		return err;
+
+sbr:
+	device_lock_assert(&pdev->dev);
+
+	bridge = pci_upstream_bridge(pdev);
+	if (bridge)
+		pci_cfg_access_lock(bridge);
+	pci_cfg_access_lock(pdev);
+	pci_save_state(pdev);
+
+	err = __pci_reset_function_locked(pdev);
+	if (err)
+		pci_err(pdev, "PCI function reset failed with %d\n", err);
+
+	pci_restore_state(pdev);
+	pci_cfg_access_unlock(pdev);
+	if (bridge)
+		pci_cfg_access_unlock(bridge);
+
+	return err;
+}
+
+static int mlxsw_pci_reset_sw(struct mlxsw_pci *mlxsw_pci)
+{
+	char mrsr_pl[MLXSW_REG_MRSR_LEN];
+
+	mlxsw_reg_mrsr_pack(mrsr_pl, MLXSW_REG_MRSR_COMMAND_SOFTWARE_RESET);
+	return mlxsw_reg_write(mlxsw_pci->core, MLXSW_REG(mrsr), mrsr_pl);
+}
+
+static int
+mlxsw_pci_reset(struct mlxsw_pci *mlxsw_pci, const struct pci_device_id *id)
+{
+	struct pci_dev *pdev = mlxsw_pci->pdev;
+	bool pci_reset_sbr_supported = false;
+	char mcam_pl[MLXSW_REG_MCAM_LEN];
+	bool pci_reset_supported = false;
+	u32 sys_status;
+	int err;
+
+	err = mlxsw_pci_sys_ready_wait(mlxsw_pci, id, &sys_status);
+	if (err) {
+		dev_err(&pdev->dev, "Failed to reach system ready status before reset. Status is 0x%x\n",
+			sys_status);
+		return err;
+	}
+
+	/* PCI core already issued a PCI reset, do not issue another reset. */
+	if (mlxsw_pci->skip_reset)
+		return 0;
+
+	mlxsw_reg_mcam_pack(mcam_pl,
+			    MLXSW_REG_MCAM_FEATURE_GROUP_ENHANCED_FEATURES);
+	err = mlxsw_reg_query(mlxsw_pci->core, MLXSW_REG(mcam), mcam_pl);
+	if (!err) {
+		mlxsw_reg_mcam_unpack(mcam_pl, MLXSW_REG_MCAM_PCI_RESET,
+				      &pci_reset_supported);
+		mlxsw_reg_mcam_unpack(mcam_pl, MLXSW_REG_MCAM_PCI_RESET_SBR,
+				      &pci_reset_sbr_supported);
+	}
+
+	if (pci_reset_supported) {
+		pci_dbg(pdev, "Starting PCI reset flow\n");
+		err = mlxsw_pci_reset_at_pci_disable(mlxsw_pci,
+						     pci_reset_sbr_supported);
+	} else {
+		pci_dbg(pdev, "Starting software reset flow\n");
+		err = mlxsw_pci_reset_sw(mlxsw_pci);
+	}
+	if (err)
+		return err;
+
+	err = mlxsw_pci_sys_ready_wait(mlxsw_pci, id, &sys_status);
+	if (err) {
+		dev_err(&pdev->dev, "Failed to reach system ready status after reset. Status is 0x%x\n",
+			sys_status);
+		return err;
+	}
+
+	return 0;
+}
+
+static int mlxsw_pci_alloc_irq_vectors(struct mlxsw_pci *mlxsw_pci)
+{
+	int err;
+
+	err = pci_alloc_irq_vectors(mlxsw_pci->pdev, 1, 1, PCI_IRQ_MSIX);
+	if (err < 0)
+		dev_err(&mlxsw_pci->pdev->dev, "MSI-X init failed\n");
+	return err;
+}
+
+static void mlxsw_pci_free_irq_vectors(struct mlxsw_pci *mlxsw_pci)
+{
+	pci_free_irq_vectors(mlxsw_pci->pdev);
+}
+
+static void mlxsw_pci_num_sg_entries_set(struct mlxsw_pci *mlxsw_pci)
+{
+	u8 num_sg_entries;
+
+	num_sg_entries = mlxsw_pci_num_sg_entries_get(MLXSW_PORT_MAX_MTU);
+	mlxsw_pci->num_sg_entries = min(num_sg_entries,
+					MLXSW_PCI_WQE_SG_ENTRIES);
+
+	WARN_ON(num_sg_entries > MLXSW_PCI_WQE_SG_ENTRIES);
 }
 
 static int mlxsw_pci_init(void *bus_priv, struct mlxsw_core *mlxsw_core,
-			  const struct mlxsw_config_profile *profile)
+			  const struct mlxsw_config_profile *profile,
+			  struct mlxsw_res *res)
 {
 	struct mlxsw_pci *mlxsw_pci = bus_priv;
 	struct pci_dev *pdev = mlxsw_pci->pdev;
@@ -1379,22 +1915,21 @@ static int mlxsw_pci_init(void *bus_priv, struct mlxsw_core *mlxsw_core,
 	u16 num_pages;
 	int err;
 
-	mutex_init(&mlxsw_pci->cmd.lock);
-	init_waitqueue_head(&mlxsw_pci->cmd.wait);
-
 	mlxsw_pci->core = mlxsw_core;
 
 	mbox = mlxsw_cmd_mbox_alloc();
 	if (!mbox)
 		return -ENOMEM;
 
-	err = mlxsw_pci_mbox_alloc(mlxsw_pci, &mlxsw_pci->cmd.in_mbox);
+	err = mlxsw_pci_reset(mlxsw_pci, mlxsw_pci->id);
 	if (err)
-		goto mbox_put;
+		goto err_reset;
 
-	err = mlxsw_pci_mbox_alloc(mlxsw_pci, &mlxsw_pci->cmd.out_mbox);
-	if (err)
-		goto err_out_mbox_alloc;
+	err = mlxsw_pci_alloc_irq_vectors(mlxsw_pci);
+	if (err < 0) {
+		dev_err(&pdev->dev, "MSI-X init failed\n");
+		goto err_alloc_irq;
+	}
 
 	err = mlxsw_cmd_query_fw(mlxsw_core, mbox);
 	if (err)
@@ -1421,6 +1956,38 @@ static int mlxsw_pci_init(void *bus_priv, struct mlxsw_core *mlxsw_core,
 	mlxsw_pci->doorbell_offset =
 		mlxsw_cmd_mbox_query_fw_doorbell_page_offset_get(mbox);
 
+	if (mlxsw_cmd_mbox_query_fw_fr_rn_clk_bar_get(mbox) != 0) {
+		dev_err(&pdev->dev, "Unsupported free running clock BAR queried from hw\n");
+		err = -EINVAL;
+		goto err_fr_rn_clk_bar;
+	}
+
+	mlxsw_pci->free_running_clock_offset =
+		mlxsw_cmd_mbox_query_fw_free_running_clock_offset_get(mbox);
+
+	if (mlxsw_cmd_mbox_query_fw_utc_sec_bar_get(mbox) != 0) {
+		dev_err(&pdev->dev, "Unsupported UTC sec BAR queried from hw\n");
+		err = -EINVAL;
+		goto err_utc_sec_bar;
+	}
+
+	mlxsw_pci->utc_sec_offset =
+		mlxsw_cmd_mbox_query_fw_utc_sec_offset_get(mbox);
+
+	if (mlxsw_cmd_mbox_query_fw_utc_nsec_bar_get(mbox) != 0) {
+		dev_err(&pdev->dev, "Unsupported UTC nsec BAR queried from hw\n");
+		err = -EINVAL;
+		goto err_utc_nsec_bar;
+	}
+
+	mlxsw_pci->utc_nsec_offset =
+		mlxsw_cmd_mbox_query_fw_utc_nsec_offset_get(mbox);
+
+	mlxsw_pci->lag_mode_support =
+		mlxsw_cmd_mbox_query_fw_lag_mode_support_get(mbox);
+	mlxsw_pci->cff_support =
+		mlxsw_cmd_mbox_query_fw_cff_support_get(mbox);
+
 	num_pages = mlxsw_cmd_mbox_query_fw_fw_pages_get(mbox);
 	err = mlxsw_pci_fw_area_init(mlxsw_pci, mbox, num_pages);
 	if (err)
@@ -1430,17 +1997,49 @@ static int mlxsw_pci_init(void *bus_priv, struct mlxsw_core *mlxsw_core,
 	if (err)
 		goto err_boardinfo;
 
-	err = mlxsw_pci_config_profile(mlxsw_pci, mbox, profile);
+	err = mlxsw_core_resources_query(mlxsw_core, mbox, res);
+	if (err)
+		goto err_query_resources;
+
+	if (MLXSW_CORE_RES_VALID(mlxsw_core, CQE_V2) &&
+	    MLXSW_CORE_RES_GET(mlxsw_core, CQE_V2))
+		mlxsw_pci->max_cqe_ver = MLXSW_PCI_CQE_V2;
+	else if (MLXSW_CORE_RES_VALID(mlxsw_core, CQE_V1) &&
+		 MLXSW_CORE_RES_GET(mlxsw_core, CQE_V1))
+		mlxsw_pci->max_cqe_ver = MLXSW_PCI_CQE_V1;
+	else if ((MLXSW_CORE_RES_VALID(mlxsw_core, CQE_V0) &&
+		  MLXSW_CORE_RES_GET(mlxsw_core, CQE_V0)) ||
+		 !MLXSW_CORE_RES_VALID(mlxsw_core, CQE_V0)) {
+		mlxsw_pci->max_cqe_ver = MLXSW_PCI_CQE_V0;
+	} else {
+		dev_err(&pdev->dev, "Invalid supported CQE version combination reported\n");
+		goto err_cqe_v_check;
+	}
+
+	err = mlxsw_pci_config_profile(mlxsw_pci, mbox, profile, res);
 	if (err)
 		goto err_config_profile;
+
+	/* Some resources depend on details of config_profile, such as unified
+	 * bridge model. Query the resources again to get correct values.
+	 */
+	err = mlxsw_core_resources_query(mlxsw_core, mbox, res);
+	if (err)
+		goto err_requery_resources;
+
+	mlxsw_pci_num_sg_entries_set(mlxsw_pci);
+
+	err = mlxsw_pci_napi_devs_init(mlxsw_pci);
+	if (err)
+		goto err_napi_devs_init;
 
 	err = mlxsw_pci_aqs_init(mlxsw_pci, mbox);
 	if (err)
 		goto err_aqs_init;
 
-	err = request_irq(mlxsw_pci->msix_entry.vector,
+	err = request_irq(pci_irq_vector(pdev, 0),
 			  mlxsw_pci_eq_irq_handler, 0,
-			  mlxsw_pci_driver_name, mlxsw_pci);
+			  mlxsw_pci->bus_info.device_kind, mlxsw_pci);
 	if (err) {
 		dev_err(&pdev->dev, "IRQ request failed\n");
 		goto err_request_eq_irq;
@@ -1451,16 +2050,24 @@ static int mlxsw_pci_init(void *bus_priv, struct mlxsw_core *mlxsw_core,
 err_request_eq_irq:
 	mlxsw_pci_aqs_fini(mlxsw_pci);
 err_aqs_init:
+	mlxsw_pci_napi_devs_fini(mlxsw_pci);
+err_napi_devs_init:
+err_requery_resources:
 err_config_profile:
+err_cqe_v_check:
+err_query_resources:
 err_boardinfo:
 	mlxsw_pci_fw_area_fini(mlxsw_pci);
 err_fw_area_init:
+err_utc_nsec_bar:
+err_utc_sec_bar:
+err_fr_rn_clk_bar:
 err_doorbell_page_bar:
 err_iface_rev:
 err_query_fw:
-	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.out_mbox);
-err_out_mbox_alloc:
-	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.in_mbox);
+	mlxsw_pci_free_irq_vectors(mlxsw_pci);
+err_alloc_irq:
+err_reset:
 mbox_put:
 	mlxsw_cmd_mbox_free(mbox);
 	return err;
@@ -1470,18 +2077,26 @@ static void mlxsw_pci_fini(void *bus_priv)
 {
 	struct mlxsw_pci *mlxsw_pci = bus_priv;
 
-	free_irq(mlxsw_pci->msix_entry.vector, mlxsw_pci);
+	free_irq(pci_irq_vector(mlxsw_pci->pdev, 0), mlxsw_pci);
 	mlxsw_pci_aqs_fini(mlxsw_pci);
+	mlxsw_pci_napi_devs_fini(mlxsw_pci);
 	mlxsw_pci_fw_area_fini(mlxsw_pci);
-	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.out_mbox);
-	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.in_mbox);
+	mlxsw_pci_free_irq_vectors(mlxsw_pci);
 }
 
 static struct mlxsw_pci_queue *
 mlxsw_pci_sdq_pick(struct mlxsw_pci *mlxsw_pci,
 		   const struct mlxsw_tx_info *tx_info)
 {
-	u8 sdqn = tx_info->local_port % mlxsw_pci_sdq_count(mlxsw_pci);
+	u8 ctl_sdq_count = mlxsw_pci->num_sdqs - 1;
+	u8 sdqn;
+
+	if (tx_info->is_emad) {
+		sdqn = MLXSW_PCI_SDQ_EMAD_INDEX;
+	} else {
+		BUILD_BUG_ON(MLXSW_PCI_SDQ_EMAD_INDEX != 0);
+		sdqn = 1 + (tx_info->local_port % ctl_sdq_count);
+	}
 
 	return mlxsw_pci_sdq_get(mlxsw_pci, sdqn);
 }
@@ -1519,11 +2134,12 @@ static int mlxsw_pci_skb_transmit(void *bus_priv, struct sk_buff *skb,
 		err = -EAGAIN;
 		goto unlock;
 	}
-	elem_info->u.sdq.skb = skb;
+	mlxsw_skb_cb(skb)->tx_info = *tx_info;
+	elem_info->sdq.skb = skb;
 
 	wqe = elem_info->elem;
 	mlxsw_pci_wqe_c_set(wqe, 1); /* always report completion */
-	mlxsw_pci_wqe_lp_set(wqe, !!tx_info->is_emad);
+	mlxsw_pci_wqe_lp_set(wqe, 0);
 	mlxsw_pci_wqe_type_set(wqe, MLXSW_PCI_WQE_TYPE_ETHERNET);
 
 	err = mlxsw_pci_wqe_frag_map(mlxsw_pci, wqe, 0, skb->data,
@@ -1541,6 +2157,9 @@ static int mlxsw_pci_skb_transmit(void *bus_priv, struct sk_buff *skb,
 		if (err)
 			goto unmap_frags;
 	}
+
+	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP))
+		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
 
 	/* Set unused sq entries byte count to zero. */
 	for (i++; i < MLXSW_PCI_WQE_SG_ENTRIES; i++)
@@ -1567,11 +2186,10 @@ static int mlxsw_pci_cmd_exec(void *bus_priv, u16 opcode, u8 opcode_mod,
 			      u8 *p_status)
 {
 	struct mlxsw_pci *mlxsw_pci = bus_priv;
-	dma_addr_t in_mapaddr = mlxsw_pci->cmd.in_mbox.mapaddr;
-	dma_addr_t out_mapaddr = mlxsw_pci->cmd.out_mbox.mapaddr;
-	bool evreq = mlxsw_pci->cmd.nopoll;
+	dma_addr_t in_mapaddr = 0, out_mapaddr = 0;
 	unsigned long timeout = msecs_to_jiffies(MLXSW_PCI_CIR_TIMEOUT_MSECS);
-	bool *p_wait_done = &mlxsw_pci->cmd.wait_done;
+	unsigned long end;
+	bool wait_done;
 	int err;
 
 	*p_status = MLXSW_CMD_STATUS_OK;
@@ -1580,47 +2198,43 @@ static int mlxsw_pci_cmd_exec(void *bus_priv, u16 opcode, u8 opcode_mod,
 	if (err)
 		return err;
 
-	if (in_mbox)
+	if (in_mbox) {
 		memcpy(mlxsw_pci->cmd.in_mbox.buf, in_mbox, in_mbox_size);
-	mlxsw_pci_write32(mlxsw_pci, CIR_IN_PARAM_HI, in_mapaddr >> 32);
-	mlxsw_pci_write32(mlxsw_pci, CIR_IN_PARAM_LO, in_mapaddr);
+		in_mapaddr = mlxsw_pci->cmd.in_mbox.mapaddr;
+	}
+	mlxsw_pci_write32(mlxsw_pci, CIR_IN_PARAM_HI, upper_32_bits(in_mapaddr));
+	mlxsw_pci_write32(mlxsw_pci, CIR_IN_PARAM_LO, lower_32_bits(in_mapaddr));
 
-	mlxsw_pci_write32(mlxsw_pci, CIR_OUT_PARAM_HI, out_mapaddr >> 32);
-	mlxsw_pci_write32(mlxsw_pci, CIR_OUT_PARAM_LO, out_mapaddr);
+	if (out_mbox)
+		out_mapaddr = mlxsw_pci->cmd.out_mbox.mapaddr;
+	mlxsw_pci_write32(mlxsw_pci, CIR_OUT_PARAM_HI, upper_32_bits(out_mapaddr));
+	mlxsw_pci_write32(mlxsw_pci, CIR_OUT_PARAM_LO, lower_32_bits(out_mapaddr));
 
 	mlxsw_pci_write32(mlxsw_pci, CIR_IN_MODIFIER, in_mod);
 	mlxsw_pci_write32(mlxsw_pci, CIR_TOKEN, 0);
 
-	*p_wait_done = false;
+	wait_done = false;
 
 	wmb(); /* all needs to be written before we write control register */
 	mlxsw_pci_write32(mlxsw_pci, CIR_CTRL,
 			  MLXSW_PCI_CIR_CTRL_GO_BIT |
-			  (evreq ? MLXSW_PCI_CIR_CTRL_EVREQ_BIT : 0) |
 			  (opcode_mod << MLXSW_PCI_CIR_CTRL_OPCODE_MOD_SHIFT) |
 			  opcode);
 
-	if (!evreq) {
-		unsigned long end;
+	end = jiffies + timeout;
+	do {
+		u32 ctrl = mlxsw_pci_read32(mlxsw_pci, CIR_CTRL);
 
-		end = jiffies + timeout;
-		do {
-			u32 ctrl = mlxsw_pci_read32(mlxsw_pci, CIR_CTRL);
-
-			if (!(ctrl & MLXSW_PCI_CIR_CTRL_GO_BIT)) {
-				*p_wait_done = true;
-				*p_status = ctrl >> MLXSW_PCI_CIR_CTRL_STATUS_SHIFT;
-				break;
-			}
-			cond_resched();
-		} while (time_before(jiffies, end));
-	} else {
-		wait_event_timeout(mlxsw_pci->cmd.wait, *p_wait_done, timeout);
-		*p_status = mlxsw_pci->cmd.comp.status;
-	}
+		if (!(ctrl & MLXSW_PCI_CIR_CTRL_GO_BIT)) {
+			wait_done = true;
+			*p_status = ctrl >> MLXSW_PCI_CIR_CTRL_STATUS_SHIFT;
+			break;
+		}
+		cond_resched();
+	} while (time_before(jiffies, end));
 
 	err = 0;
-	if (*p_wait_done) {
+	if (wait_done) {
 		if (*p_status)
 			err = -EIO;
 	} else {
@@ -1634,20 +2248,67 @@ static int mlxsw_pci_cmd_exec(void *bus_priv, u16 opcode, u8 opcode_mod,
 		 */
 		__be32 tmp;
 
-		if (!evreq) {
-			tmp = cpu_to_be32(mlxsw_pci_read32(mlxsw_pci,
-							   CIR_OUT_PARAM_HI));
-			memcpy(out_mbox, &tmp, sizeof(tmp));
-			tmp = cpu_to_be32(mlxsw_pci_read32(mlxsw_pci,
-							   CIR_OUT_PARAM_LO));
-			memcpy(out_mbox + sizeof(tmp), &tmp, sizeof(tmp));
-		}
-	} else if (!err && out_mbox)
+		tmp = cpu_to_be32(mlxsw_pci_read32(mlxsw_pci,
+						   CIR_OUT_PARAM_HI));
+		memcpy(out_mbox, &tmp, sizeof(tmp));
+		tmp = cpu_to_be32(mlxsw_pci_read32(mlxsw_pci,
+						   CIR_OUT_PARAM_LO));
+		memcpy(out_mbox + sizeof(tmp), &tmp, sizeof(tmp));
+	} else if (!err && out_mbox) {
 		memcpy(out_mbox, mlxsw_pci->cmd.out_mbox.buf, out_mbox_size);
+	}
 
 	mutex_unlock(&mlxsw_pci->cmd.lock);
 
 	return err;
+}
+
+static u32 mlxsw_pci_read_frc_h(void *bus_priv)
+{
+	struct mlxsw_pci *mlxsw_pci = bus_priv;
+	u64 frc_offset_h;
+
+	frc_offset_h = mlxsw_pci->free_running_clock_offset;
+	return mlxsw_pci_read32_off(mlxsw_pci, frc_offset_h);
+}
+
+static u32 mlxsw_pci_read_frc_l(void *bus_priv)
+{
+	struct mlxsw_pci *mlxsw_pci = bus_priv;
+	u64 frc_offset_l;
+
+	frc_offset_l = mlxsw_pci->free_running_clock_offset + 4;
+	return mlxsw_pci_read32_off(mlxsw_pci, frc_offset_l);
+}
+
+static u32 mlxsw_pci_read_utc_sec(void *bus_priv)
+{
+	struct mlxsw_pci *mlxsw_pci = bus_priv;
+
+	return mlxsw_pci_read32_off(mlxsw_pci, mlxsw_pci->utc_sec_offset);
+}
+
+static u32 mlxsw_pci_read_utc_nsec(void *bus_priv)
+{
+	struct mlxsw_pci *mlxsw_pci = bus_priv;
+
+	return mlxsw_pci_read32_off(mlxsw_pci, mlxsw_pci->utc_nsec_offset);
+}
+
+static enum mlxsw_cmd_mbox_config_profile_lag_mode
+mlxsw_pci_lag_mode(void *bus_priv)
+{
+	struct mlxsw_pci *mlxsw_pci = bus_priv;
+
+	return mlxsw_pci->lag_mode;
+}
+
+static enum mlxsw_cmd_mbox_config_profile_flood_mode
+mlxsw_pci_flood_mode(void *bus_priv)
+{
+	struct mlxsw_pci *mlxsw_pci = bus_priv;
+
+	return mlxsw_pci->flood_mode;
 }
 
 static const struct mlxsw_bus mlxsw_pci_bus = {
@@ -1657,20 +2318,48 @@ static const struct mlxsw_bus mlxsw_pci_bus = {
 	.skb_transmit_busy	= mlxsw_pci_skb_transmit_busy,
 	.skb_transmit		= mlxsw_pci_skb_transmit,
 	.cmd_exec		= mlxsw_pci_cmd_exec,
+	.read_frc_h		= mlxsw_pci_read_frc_h,
+	.read_frc_l		= mlxsw_pci_read_frc_l,
+	.read_utc_sec		= mlxsw_pci_read_utc_sec,
+	.read_utc_nsec		= mlxsw_pci_read_utc_nsec,
+	.lag_mode		= mlxsw_pci_lag_mode,
+	.flood_mode		= mlxsw_pci_flood_mode,
+	.features		= MLXSW_BUS_F_TXRX | MLXSW_BUS_F_RESET,
 };
 
-static int mlxsw_pci_sw_reset(struct mlxsw_pci *mlxsw_pci)
+static int mlxsw_pci_cmd_init(struct mlxsw_pci *mlxsw_pci)
 {
-	mlxsw_pci_write32(mlxsw_pci, SW_RESET, MLXSW_PCI_SW_RESET_RST_BIT);
-	/* Current firware does not let us know when the reset is done.
-	 * So we just wait here for constant time and hope for the best.
-	 */
-	msleep(MLXSW_PCI_SW_RESET_TIMEOUT_MSECS);
+	int err;
+
+	mutex_init(&mlxsw_pci->cmd.lock);
+
+	err = mlxsw_pci_mbox_alloc(mlxsw_pci, &mlxsw_pci->cmd.in_mbox);
+	if (err)
+		goto err_in_mbox_alloc;
+
+	err = mlxsw_pci_mbox_alloc(mlxsw_pci, &mlxsw_pci->cmd.out_mbox);
+	if (err)
+		goto err_out_mbox_alloc;
+
 	return 0;
+
+err_out_mbox_alloc:
+	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.in_mbox);
+err_in_mbox_alloc:
+	mutex_destroy(&mlxsw_pci->cmd.lock);
+	return err;
+}
+
+static void mlxsw_pci_cmd_fini(struct mlxsw_pci *mlxsw_pci)
+{
+	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.out_mbox);
+	mlxsw_pci_mbox_free(mlxsw_pci, &mlxsw_pci->cmd.in_mbox);
+	mutex_destroy(&mlxsw_pci->cmd.lock);
 }
 
 static int mlxsw_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	const char *driver_name = dev_driver_string(&pdev->dev);
 	struct mlxsw_pci *mlxsw_pci;
 	int err;
 
@@ -1684,23 +2373,17 @@ static int mlxsw_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto err_pci_enable_device;
 	}
 
-	err = pci_request_regions(pdev, mlxsw_pci_driver_name);
+	err = pci_request_regions(pdev, driver_name);
 	if (err) {
 		dev_err(&pdev->dev, "pci_request_regions failed\n");
 		goto err_pci_request_regions;
 	}
 
-	err = pci_set_dma_mask(pdev, DMA_BIT_MASK(64));
-	if (!err) {
-		err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (err) {
+		err = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
 		if (err) {
-			dev_err(&pdev->dev, "pci_set_consistent_dma_mask failed\n");
-			goto err_pci_set_dma_mask;
-		}
-	} else {
-		err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
-		if (err) {
-			dev_err(&pdev->dev, "pci_set_dma_mask failed\n");
+			dev_err(&pdev->dev, "dma_set_mask failed\n");
 			goto err_pci_set_dma_mask;
 		}
 	}
@@ -1723,32 +2406,19 @@ static int mlxsw_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	mlxsw_pci->pdev = pdev;
 	pci_set_drvdata(pdev, mlxsw_pci);
 
-	err = mlxsw_pci_sw_reset(mlxsw_pci);
-	if (err) {
-		dev_err(&pdev->dev, "Software reset failed\n");
-		goto err_sw_reset;
-	}
+	err = mlxsw_pci_cmd_init(mlxsw_pci);
+	if (err)
+		goto err_pci_cmd_init;
 
-	err = pci_enable_msix_exact(pdev, &mlxsw_pci->msix_entry, 1);
-	if (err) {
-		dev_err(&pdev->dev, "MSI-X init failed\n");
-		goto err_msix_init;
-	}
-
-	mlxsw_pci->bus_info.device_kind = mlxsw_pci_device_kind_get(id);
+	mlxsw_pci->bus_info.device_kind = driver_name;
 	mlxsw_pci->bus_info.device_name = pci_name(mlxsw_pci->pdev);
 	mlxsw_pci->bus_info.dev = &pdev->dev;
-
-	mlxsw_pci->dbg_dir = debugfs_create_dir(mlxsw_pci->bus_info.device_name,
-						mlxsw_pci_dbg_root);
-	if (!mlxsw_pci->dbg_dir) {
-		dev_err(&pdev->dev, "Failed to create debugfs dir\n");
-		err = -ENOMEM;
-		goto err_dbg_create_dir;
-	}
+	mlxsw_pci->bus_info.read_clock_capable = true;
+	mlxsw_pci->id = id;
 
 	err = mlxsw_core_bus_device_register(&mlxsw_pci->bus_info,
-					     &mlxsw_pci_bus, mlxsw_pci);
+					     &mlxsw_pci_bus, mlxsw_pci, false,
+					     NULL, NULL);
 	if (err) {
 		dev_err(&pdev->dev, "cannot register bus device\n");
 		goto err_bus_device_register;
@@ -1757,11 +2427,8 @@ static int mlxsw_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	return 0;
 
 err_bus_device_register:
-	debugfs_remove_recursive(mlxsw_pci->dbg_dir);
-err_dbg_create_dir:
-	pci_disable_msix(mlxsw_pci->pdev);
-err_msix_init:
-err_sw_reset:
+	mlxsw_pci_cmd_fini(mlxsw_pci);
+err_pci_cmd_init:
 	iounmap(mlxsw_pci->hw_addr);
 err_ioremap:
 err_pci_resource_len_check:
@@ -1778,43 +2445,59 @@ static void mlxsw_pci_remove(struct pci_dev *pdev)
 {
 	struct mlxsw_pci *mlxsw_pci = pci_get_drvdata(pdev);
 
-	mlxsw_core_bus_device_unregister(mlxsw_pci->core);
-	debugfs_remove_recursive(mlxsw_pci->dbg_dir);
-	pci_disable_msix(mlxsw_pci->pdev);
+	mlxsw_core_bus_device_unregister(mlxsw_pci->core, false);
+	mlxsw_pci_cmd_fini(mlxsw_pci);
 	iounmap(mlxsw_pci->hw_addr);
 	pci_release_regions(mlxsw_pci->pdev);
 	pci_disable_device(mlxsw_pci->pdev);
 	kfree(mlxsw_pci);
 }
 
-static struct pci_driver mlxsw_pci_driver = {
-	.name		= mlxsw_pci_driver_name,
-	.id_table	= mlxsw_pci_id_table,
-	.probe		= mlxsw_pci_probe,
-	.remove		= mlxsw_pci_remove,
+static void mlxsw_pci_reset_prepare(struct pci_dev *pdev)
+{
+	struct mlxsw_pci *mlxsw_pci = pci_get_drvdata(pdev);
+
+	mlxsw_core_bus_device_unregister(mlxsw_pci->core, false);
+}
+
+static void mlxsw_pci_reset_done(struct pci_dev *pdev)
+{
+	struct mlxsw_pci *mlxsw_pci = pci_get_drvdata(pdev);
+
+	mlxsw_pci->skip_reset = true;
+	mlxsw_core_bus_device_register(&mlxsw_pci->bus_info, &mlxsw_pci_bus,
+				       mlxsw_pci, false, NULL, NULL);
+	mlxsw_pci->skip_reset = false;
+}
+
+static const struct pci_error_handlers mlxsw_pci_err_handler = {
+	.reset_prepare = mlxsw_pci_reset_prepare,
+	.reset_done = mlxsw_pci_reset_done,
 };
+
+int mlxsw_pci_driver_register(struct pci_driver *pci_driver)
+{
+	pci_driver->probe = mlxsw_pci_probe;
+	pci_driver->remove = mlxsw_pci_remove;
+	pci_driver->shutdown = mlxsw_pci_remove;
+	pci_driver->err_handler = &mlxsw_pci_err_handler;
+	return pci_register_driver(pci_driver);
+}
+EXPORT_SYMBOL(mlxsw_pci_driver_register);
+
+void mlxsw_pci_driver_unregister(struct pci_driver *pci_driver)
+{
+	pci_unregister_driver(pci_driver);
+}
+EXPORT_SYMBOL(mlxsw_pci_driver_unregister);
 
 static int __init mlxsw_pci_module_init(void)
 {
-	int err;
-
-	mlxsw_pci_dbg_root = debugfs_create_dir(mlxsw_pci_driver_name, NULL);
-	if (!mlxsw_pci_dbg_root)
-		return -ENOMEM;
-	err = pci_register_driver(&mlxsw_pci_driver);
-	if (err)
-		goto err_register_driver;
 	return 0;
-
-err_register_driver:
-	debugfs_remove_recursive(mlxsw_pci_dbg_root);
-	return err;
 }
 
 static void __exit mlxsw_pci_module_exit(void)
 {
-	pci_unregister_driver(&mlxsw_pci_driver);
-	debugfs_remove_recursive(mlxsw_pci_dbg_root);
 }
 
 module_init(mlxsw_pci_module_init);
@@ -1823,4 +2506,3 @@ module_exit(mlxsw_pci_module_exit);
 MODULE_LICENSE("Dual BSD/GPL");
 MODULE_AUTHOR("Jiri Pirko <jiri@mellanox.com>");
 MODULE_DESCRIPTION("Mellanox switch PCI interface driver");
-MODULE_DEVICE_TABLE(pci, mlxsw_pci_id_table);

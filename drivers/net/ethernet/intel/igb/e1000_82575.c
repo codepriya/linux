@@ -1,25 +1,5 @@
-/* Intel(R) Gigabit Ethernet Linux driver
- * Copyright(c) 2007-2015 Intel Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
- * You should have received a copy of the GNU General Public License along with
- * this program; if not, see <http://www.gnu.org/licenses/>.
- *
- * The full GNU General Public License is included in this distribution in
- * the file called "COPYING".
- *
- * Contact Information:
- * e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
- * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
- */
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 2007 - 2018 Intel Corporation. */
 
 /* e1000_82575
  * e1000_82576
@@ -34,6 +14,7 @@
 #include "e1000_mac.h"
 #include "e1000_82575.h"
 #include "e1000_i210.h"
+#include "igb.h"
 
 static s32  igb_get_invariants_82575(struct e1000_hw *);
 static s32  igb_acquire_phy_82575(struct e1000_hw *);
@@ -45,8 +26,6 @@ static s32  igb_get_cfg_done_82575(struct e1000_hw *);
 static s32  igb_init_hw_82575(struct e1000_hw *);
 static s32  igb_phy_hw_reset_sgmii_82575(struct e1000_hw *);
 static s32  igb_read_phy_reg_sgmii_82575(struct e1000_hw *, u32, u16 *);
-static s32  igb_read_phy_reg_82580(struct e1000_hw *, u32, u16 *);
-static s32  igb_write_phy_reg_82580(struct e1000_hw *, u32, u16);
 static s32  igb_reset_hw_82575(struct e1000_hw *);
 static s32  igb_reset_hw_82580(struct e1000_hw *);
 static s32  igb_set_d0_lplu_state_82575(struct e1000_hw *, bool);
@@ -72,6 +51,32 @@ static s32 igb_validate_nvm_checksum_i350(struct e1000_hw *hw);
 static s32 igb_update_nvm_checksum_i350(struct e1000_hw *hw);
 static const u16 e1000_82580_rxpbs_table[] = {
 	36, 72, 144, 1, 2, 4, 8, 16, 35, 70, 140 };
+
+/* Due to a hw errata, if the host tries to  configure the VFTA register
+ * while performing queries from the BMC or DMA, then the VFTA in some
+ * cases won't be written.
+ */
+
+/**
+ *  igb_write_vfta_i350 - Write value to VLAN filter table
+ *  @hw: pointer to the HW structure
+ *  @offset: register offset in VLAN filter table
+ *  @value: register value written to VLAN filter table
+ *
+ *  Writes value at the given offset in the register array which stores
+ *  the VLAN filter table.
+ **/
+static void igb_write_vfta_i350(struct e1000_hw *hw, u32 offset, u32 value)
+{
+	struct igb_adapter *adapter = hw->back;
+	int i;
+
+	for (i = 10; i--;)
+		array_wr32(E1000_VFTA, offset, value);
+
+	wrfl();
+	adapter->shadow_vfta[offset] = value;
+}
 
 /**
  *  igb_sgmii_uses_mdio_82575 - Determine if I2C pins are for external MDIO
@@ -205,13 +210,10 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
 		case e1000_82580:
 		case e1000_i350:
 		case e1000_i354:
-			phy->ops.read_reg = igb_read_phy_reg_82580;
-			phy->ops.write_reg = igb_write_phy_reg_82580;
-			break;
 		case e1000_i210:
 		case e1000_i211:
-			phy->ops.read_reg = igb_read_phy_reg_gs40g;
-			phy->ops.write_reg = igb_write_phy_reg_gs40g;
+			phy->ops.read_reg = igb_read_phy_reg_82580;
+			phy->ops.write_reg = igb_write_phy_reg_82580;
 			break;
 		default:
 			phy->ops.read_reg = igb_read_phy_reg_igp;
@@ -220,8 +222,7 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
 	}
 
 	/* set lan id */
-	hw->bus.func = (rd32(E1000_STATUS) & E1000_STATUS_FUNC_MASK) >>
-			E1000_STATUS_FUNC_SHIFT;
+	hw->bus.func = FIELD_GET(E1000_STATUS_FUNC_MASK, rd32(E1000_STATUS));
 
 	/* Set phy->phy_addr and phy->id. */
 	ret_val = igb_get_phy_id_82575(hw);
@@ -260,8 +261,8 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
 			if (ret_val)
 				goto out;
 
-			data = (data & E1000_M88E1112_MAC_CTRL_1_MODE_MASK) >>
-			       E1000_M88E1112_MAC_CTRL_1_MODE_SHIFT;
+			data = FIELD_GET(E1000_M88E1112_MAC_CTRL_1_MODE_MASK,
+					 data);
 			if (data == E1000_M88E1112_AUTO_COPPER_SGMII ||
 			    data == E1000_M88E1112_AUTO_COPPER_BASEX)
 				hw->mac.ops.check_for_link =
@@ -269,6 +270,11 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
 		}
 		if (phy->id == M88E1512_E_PHY_ID) {
 			ret_val = igb_initialize_M88E1512_phy(hw);
+			if (ret_val)
+				goto out;
+		}
+		if (phy->id == M88E1543_E_PHY_ID) {
+			ret_val = igb_initialize_M88E1543_phy(hw);
 			if (ret_val)
 				goto out;
 		}
@@ -294,11 +300,15 @@ static s32 igb_init_phy_params_82575(struct e1000_hw *hw)
 	case I210_I_PHY_ID:
 		phy->type		= e1000_phy_i210;
 		phy->ops.check_polarity	= igb_check_polarity_m88;
+		phy->ops.get_cfg_done	= igb_get_cfg_done_i210;
 		phy->ops.get_phy_info	= igb_get_phy_info_m88;
 		phy->ops.get_cable_length = igb_get_cable_length_m88_gen2;
 		phy->ops.set_d0_lplu_state = igb_set_d0_lplu_state_82580;
 		phy->ops.set_d3_lplu_state = igb_set_d3_lplu_state_82580;
 		phy->ops.force_speed_duplex = igb_phy_force_speed_duplex_m88;
+		break;
+	case BCM54616_E_PHY_ID:
+		phy->type = e1000_phy_bcm54616;
 		break;
 	default:
 		ret_val = -E1000_ERR_PHY;
@@ -319,8 +329,7 @@ static s32 igb_init_nvm_params_82575(struct e1000_hw *hw)
 	u32 eecd = rd32(E1000_EECD);
 	u16 size;
 
-	size = (u16)((eecd & E1000_EECD_SIZE_EX_MASK) >>
-		     E1000_EECD_SIZE_EX_SHIFT);
+	size = FIELD_GET(E1000_EECD_SIZE_EX_MASK, eecd);
 
 	/* Added to a constant, "size" becomes the left-shift value
 	 * for setting word_size.
@@ -333,7 +342,7 @@ static s32 igb_init_nvm_params_82575(struct e1000_hw *hw)
 	if (size > 15)
 		size = 15;
 
-	nvm->word_size = 1 << size;
+	nvm->word_size = BIT(size);
 	nvm->opcode_bits = 8;
 	nvm->delay_usec = 1;
 
@@ -352,7 +361,7 @@ static s32 igb_init_nvm_params_82575(struct e1000_hw *hw)
 				    16 : 8;
 		break;
 	}
-	if (nvm->word_size == (1 << 15))
+	if (nvm->word_size == BIT(15))
 		nvm->page_size = 128;
 
 	nvm->type = e1000_nvm_eeprom_spi;
@@ -363,7 +372,7 @@ static s32 igb_init_nvm_params_82575(struct e1000_hw *hw)
 	nvm->ops.write = igb_write_nvm_spi;
 	nvm->ops.validate = igb_validate_nvm_checksum;
 	nvm->ops.update = igb_update_nvm_checksum;
-	if (nvm->word_size < (1 << 15))
+	if (nvm->word_size < BIT(15))
 		nvm->ops.read = igb_read_nvm_eerd;
 	else
 		nvm->ops.read = igb_read_nvm_spi;
@@ -397,6 +406,8 @@ static s32 igb_init_mac_params_82575(struct e1000_hw *hw)
 
 	/* Set mta register count */
 	mac->mta_reg_count = 128;
+	/* Set uta register count */
+	mac->uta_reg_count = (hw->mac.type == e1000_82575) ? 0 : 128;
 	/* Set rar entry count */
 	switch (mac->type) {
 	case e1000_82576:
@@ -428,6 +439,11 @@ static s32 igb_init_mac_params_82575(struct e1000_hw *hw)
 		mac->ops.release_swfw_sync = igb_release_swfw_sync_82575;
 	}
 
+	if ((hw->mac.type == e1000_i350) || (hw->mac.type == e1000_i354))
+		mac->ops.write_vfta = igb_write_vfta_i350;
+	else
+		mac->ops.write_vfta = igb_write_vfta;
+
 	/* Set if part includes ASF firmware */
 	mac->asf_firmware_present = true;
 	/* Set if manageability features are enabled. */
@@ -448,7 +464,7 @@ static s32 igb_init_mac_params_82575(struct e1000_hw *hw)
 			? igb_setup_copper_link_82575
 			: igb_setup_serdes_link_82575;
 
-	if (mac->type == e1000_82580) {
+	if (mac->type == e1000_82580 || mac->type == e1000_i350) {
 		switch (hw->device_id) {
 		/* feature not supported on these id's */
 		case E1000_DEV_ID_DH89XXCC_SGMII:
@@ -512,7 +528,7 @@ static s32 igb_set_sfp_media_type_82575(struct e1000_hw *hw)
 		dev_spec->module_plugged = true;
 		if (eth_flags->e1000_base_lx || eth_flags->e1000_base_sx) {
 			hw->phy.media_type = e1000_media_type_internal_serdes;
-		} else if (eth_flags->e100_base_fx) {
+		} else if (eth_flags->e100_base_fx || eth_flags->e100_base_lx) {
 			dev_spec->sgmii_active = true;
 			hw->phy.media_type = e1000_media_type_internal_serdes;
 		} else if (eth_flags->e1000_base_t) {
@@ -620,7 +636,7 @@ static s32 igb_get_invariants_82575(struct e1000_hw *hw)
 			dev_spec->sgmii_active = true;
 			break;
 		}
-		/* fall through for I2C based SGMII */
+		fallthrough; /* for I2C based SGMII */
 	case E1000_CTRL_EXT_LINK_MODE_PCIE_SERDES:
 		/* read media type from SFP EEPROM */
 		ret_val = igb_set_sfp_media_type_82575(hw);
@@ -639,14 +655,10 @@ static s32 igb_get_invariants_82575(struct e1000_hw *hw)
 			break;
 		}
 
-		/* do not change link mode for 100BaseFX */
-		if (dev_spec->eth_flags.e100_base_fx)
-			break;
-
 		/* change current link mode setting */
 		ctrl_ext &= ~E1000_CTRL_EXT_LINK_MODE_MASK;
 
-		if (hw->phy.media_type == e1000_media_type_copper)
+		if (dev_spec->sgmii_active)
 			ctrl_ext |= E1000_CTRL_EXT_LINK_MODE_SGMII;
 		else
 			ctrl_ext |= E1000_CTRL_EXT_LINK_MODE_PCIE_SERDES;
@@ -925,6 +937,8 @@ static s32 igb_phy_hw_reset_sgmii_82575(struct e1000_hw *hw)
 
 	if (phy->id == M88E1512_E_PHY_ID)
 		ret_val = igb_initialize_M88E1512_phy(hw);
+	if (phy->id == M88E1543_E_PHY_ID)
+		ret_val = igb_initialize_M88E1543_phy(hw);
 out:
 	return ret_val;
 }
@@ -1514,10 +1528,7 @@ static s32 igb_init_hw_82575(struct e1000_hw *hw)
 
 	/* Disabling VLAN filtering */
 	hw_dbg("Initializing the IEEE VLAN\n");
-	if ((hw->mac.type == e1000_i350) || (hw->mac.type == e1000_i354))
-		igb_clear_vfta_i350(hw);
-	else
-		igb_clear_vfta(hw);
+	igb_clear_vfta(hw);
 
 	/* Setup the receive address */
 	igb_init_rx_addrs(hw, rar_count);
@@ -1613,6 +1624,9 @@ static s32 igb_setup_copper_link_82575(struct e1000_hw *hw)
 	case e1000_phy_82580:
 		ret_val = igb_copper_link_setup_82580(hw);
 		break;
+	case e1000_phy_bcm54616:
+		ret_val = 0;
+		break;
 	default:
 		ret_val = -E1000_ERR_PHY;
 		break;
@@ -1688,6 +1702,7 @@ static s32 igb_setup_serdes_link_82575(struct e1000_hw *hw)
 	case E1000_CTRL_EXT_LINK_MODE_1000BASE_KX:
 		/* disable PCS autoneg and support parallel detect only */
 		pcs_autoneg = false;
+		fallthrough;
 	default:
 		if (hw->mac.type == e1000_82575 ||
 		    hw->mac.type == e1000_82576) {
@@ -2073,7 +2088,7 @@ void igb_vmdq_set_anti_spoofing_pf(struct e1000_hw *hw, bool enable, int pf)
 		/* The PF can spoof - it has to in order to
 		 * support emulation mode NICs
 		 */
-		reg_val ^= (1 << pf | 1 << (pf + MAX_NUM_VFS));
+		reg_val ^= (BIT(pf) | BIT(pf + MAX_NUM_VFS));
 	} else {
 		reg_val &= ~(E1000_DTXSWC_MAC_SPOOF_MASK |
 			     E1000_DTXSWC_VLAN_SPOOF_MASK);
@@ -2145,7 +2160,7 @@ void igb_vmdq_set_replication_pf(struct e1000_hw *hw, bool enable)
  *  Reads the MDI control register in the PHY at offset and stores the
  *  information read to data.
  **/
-static s32 igb_read_phy_reg_82580(struct e1000_hw *hw, u32 offset, u16 *data)
+s32 igb_read_phy_reg_82580(struct e1000_hw *hw, u32 offset, u16 *data)
 {
 	s32 ret_val;
 
@@ -2169,7 +2184,7 @@ out:
  *
  *  Writes data to MDI control register in the PHY at offset.
  **/
-static s32 igb_write_phy_reg_82580(struct e1000_hw *hw, u32 offset, u16 data)
+s32 igb_write_phy_reg_82580(struct e1000_hw *hw, u32 offset, u16 data)
 {
 	s32 ret_val;
 
@@ -2190,7 +2205,7 @@ out:
  *  igb_reset_mdicnfg_82580 - Reset MDICNFG destination and com_mdio bits
  *  @hw: pointer to the HW structure
  *
- *  This resets the the MDICNFG.Destination and MDICNFG.Com_MDIO bits based on
+ *  This resets the MDICNFG.Destination and MDICNFG.Com_MDIO bits based on
  *  the values found in the EEPROM.  This addresses an issue in which these
  *  bits are not restored from EEPROM after reset.
  **/
@@ -2537,7 +2552,7 @@ out:
 /**
  *  __igb_access_emi_reg - Read/write EMI register
  *  @hw: pointer to the HW structure
- *  @addr: EMI address to program
+ *  @address: EMI address to program
  *  @data: pointer to value to read/write from/to the EMI address
  *  @read: boolean flag to indicate read or write
  **/
@@ -2573,7 +2588,7 @@ s32 igb_read_emi_reg(struct e1000_hw *hw, u16 addr, u16 *data)
  *  igb_set_eee_i350 - Enable/disable EEE support
  *  @hw: pointer to the HW structure
  *  @adv1G: boolean flag enabling 1G EEE advertisement
- *  @adv100m: boolean flag enabling 100M EEE advertisement
+ *  @adv100M: boolean flag enabling 100M EEE advertisement
  *
  *  Enable/disable EEE based on setting in dev_spec structure.
  *
@@ -2629,7 +2644,7 @@ out:
  *  igb_set_eee_i354 - Enable/disable EEE support
  *  @hw: pointer to the HW structure
  *  @adv1G: boolean flag enabling 1G EEE advertisement
- *  @adv100m: boolean flag enabling 100M EEE advertisement
+ *  @adv100M: boolean flag enabling 100M EEE advertisement
  *
  *  Enable/disable EEE legacy mode based on setting in dev_spec structure.
  *
@@ -2739,6 +2754,7 @@ out:
 	return ret_val;
 }
 
+#ifdef CONFIG_IGB_HWMON
 static const u8 e1000_emc_temp_data[4] = {
 	E1000_EMC_INTERNAL_DATA,
 	E1000_EMC_DIODE1_DATA,
@@ -2752,7 +2768,6 @@ static const u8 e1000_emc_therm_limit[4] = {
 	E1000_EMC_DIODE3_THERM_LIMIT
 };
 
-#ifdef CONFIG_IGB_HWMON
 /**
  *  igb_get_thermal_sensor_data_generic - Gathers thermal sensor data
  *  @hw: pointer to hardware structure
@@ -2781,7 +2796,7 @@ static s32 igb_get_thermal_sensor_data_generic(struct e1000_hw *hw)
 		return 0;
 
 	hw->nvm.ops.read(hw, ets_offset, 1, &ets_cfg);
-	if (((ets_cfg & NVM_ETS_TYPE_MASK) >> NVM_ETS_TYPE_SHIFT)
+	if (FIELD_GET(NVM_ETS_TYPE_MASK, ets_cfg)
 	    != NVM_ETS_TYPE_EMC)
 		return E1000_NOT_IMPLEMENTED;
 
@@ -2791,10 +2806,8 @@ static s32 igb_get_thermal_sensor_data_generic(struct e1000_hw *hw)
 
 	for (i = 1; i < num_sensors; i++) {
 		hw->nvm.ops.read(hw, (ets_offset + i), 1, &ets_sensor);
-		sensor_index = ((ets_sensor & NVM_ETS_DATA_INDEX_MASK) >>
-				NVM_ETS_DATA_INDEX_SHIFT);
-		sensor_location = ((ets_sensor & NVM_ETS_DATA_LOC_MASK) >>
-				   NVM_ETS_DATA_LOC_SHIFT);
+		sensor_index = FIELD_GET(NVM_ETS_DATA_INDEX_MASK, ets_sensor);
+		sensor_location = FIELD_GET(NVM_ETS_DATA_LOC_MASK, ets_sensor);
 
 		if (sensor_location != 0)
 			hw->phy.ops.read_i2c_byte(hw,
@@ -2842,20 +2855,17 @@ static s32 igb_init_thermal_sensor_thresh_generic(struct e1000_hw *hw)
 		return 0;
 
 	hw->nvm.ops.read(hw, ets_offset, 1, &ets_cfg);
-	if (((ets_cfg & NVM_ETS_TYPE_MASK) >> NVM_ETS_TYPE_SHIFT)
+	if (FIELD_GET(NVM_ETS_TYPE_MASK, ets_cfg)
 	    != NVM_ETS_TYPE_EMC)
 		return E1000_NOT_IMPLEMENTED;
 
-	low_thresh_delta = ((ets_cfg & NVM_ETS_LTHRES_DELTA_MASK) >>
-			    NVM_ETS_LTHRES_DELTA_SHIFT);
+	low_thresh_delta = FIELD_GET(NVM_ETS_LTHRES_DELTA_MASK, ets_cfg);
 	num_sensors = (ets_cfg & NVM_ETS_NUM_SENSORS_MASK);
 
 	for (i = 1; i <= num_sensors; i++) {
 		hw->nvm.ops.read(hw, (ets_offset + i), 1, &ets_sensor);
-		sensor_index = ((ets_sensor & NVM_ETS_DATA_INDEX_MASK) >>
-				NVM_ETS_DATA_INDEX_SHIFT);
-		sensor_location = ((ets_sensor & NVM_ETS_DATA_LOC_MASK) >>
-				   NVM_ETS_DATA_LOC_SHIFT);
+		sensor_index = FIELD_GET(NVM_ETS_DATA_INDEX_MASK, ets_sensor);
+		sensor_location = FIELD_GET(NVM_ETS_DATA_LOC_MASK, ets_sensor);
 		therm_limit = ets_sensor & NVM_ETS_DATA_HTHRESH_MASK;
 
 		hw->phy.ops.write_i2c_byte(hw,
@@ -2886,7 +2896,7 @@ static struct e1000_mac_operations e1000_mac_ops_82575 = {
 #endif
 };
 
-static struct e1000_phy_operations e1000_phy_ops_82575 = {
+static const struct e1000_phy_operations e1000_phy_ops_82575 = {
 	.acquire              = igb_acquire_phy_82575,
 	.get_cfg_done         = igb_get_cfg_done_82575,
 	.release              = igb_release_phy_82575,

@@ -25,7 +25,7 @@
 #include "chan.h"
 #include "nvsw.h"
 
-#include <nvif/ioctl.h>
+#include <nvif/class.h>
 
 /*******************************************************************************
  * software context
@@ -36,7 +36,7 @@ nv10_sw_chan = {
 };
 
 static int
-nv10_sw_chan_new(struct nvkm_sw *sw, struct nvkm_fifo_chan *fifo,
+nv10_sw_chan_new(struct nvkm_sw *sw, struct nvkm_chan *fifo,
 		 const struct nvkm_oclass *oclass, struct nvkm_object **pobject)
 {
 	struct nvkm_sw_chan *chan;
@@ -56,13 +56,13 @@ static const struct nvkm_sw_func
 nv10_sw = {
 	.chan_new = nv10_sw_chan_new,
 	.sclass = {
-		{ nvkm_nvsw_new, { -1, -1, NVIF_IOCTL_NEW_V0_SW_NV10 } },
+		{ nvkm_nvsw_new, { -1, -1, NVIF_CLASS_SW_NV10 } },
 		{}
 	}
 };
 
 int
-nv10_sw_new(struct nvkm_device *device, int index, struct nvkm_sw **psw)
+nv10_sw_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst, struct nvkm_sw **psw)
 {
-	return nvkm_sw_new_(&nv10_sw, device, index, psw);
+	return nvkm_sw_new_(&nv10_sw, device, type, inst, psw);
 }

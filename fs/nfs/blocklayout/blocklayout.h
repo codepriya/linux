@@ -40,8 +40,8 @@
 #include "../pnfs.h"
 #include "../netns.h"
 
-#define PAGE_CACHE_SECTORS (PAGE_CACHE_SIZE >> SECTOR_SHIFT)
-#define PAGE_CACHE_SECTOR_SHIFT (PAGE_CACHE_SHIFT - SECTOR_SHIFT)
+#define PAGE_CACHE_SECTORS (PAGE_SIZE >> SECTOR_SHIFT)
+#define PAGE_CACHE_SECTOR_SHIFT (PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTOR_SIZE (1 << SECTOR_SHIFT)
 
 struct pnfs_block_dev;
@@ -54,7 +54,6 @@ struct pnfs_block_dev;
  * Not actually limited by the protocol.
  */
 #define PNFS_BLOCK_UUID_LEN	128
-
 
 struct pnfs_block_volume {
 	enum pnfs_block_volume_type	type;
@@ -82,14 +81,20 @@ struct pnfs_block_volume {
 			u32		volumes_count;
 			u32		volumes[PNFS_BLOCK_MAX_DEVICES];
 		} stripe;
+		struct {
+			enum scsi_code_set		code_set;
+			enum scsi_designator_type	designator_type;
+			int				designator_len;
+			u8				designator[256];
+			u64				pr_key;
+		} scsi;
 	};
 };
 
 struct pnfs_block_dev_map {
-	sector_t			start;
-	sector_t			len;
-
-	sector_t			disk_offset;
+	u64			start;
+	u64			len;
+	u64			disk_offset;
 	struct block_device		*bdev;
 };
 
@@ -99,15 +104,24 @@ struct pnfs_block_dev {
 	u64				start;
 	u64				len;
 
+	enum pnfs_block_volume_type	type;
 	u32				nr_children;
 	struct pnfs_block_dev		*children;
 	u64				chunk_size;
 
-	struct block_device		*bdev;
+	struct file			*bdev_file;
 	u64				disk_offset;
+	unsigned long			flags;
+
+	u64				pr_key;
 
 	bool (*map)(struct pnfs_block_dev *dev, u64 offset,
 			struct pnfs_block_dev_map *map);
+};
+
+/* pnfs_block_dev flag bits */
+enum {
+	PNFS_BDEV_REGISTERED = 0,
 };
 
 /* sector_t fields are all in 512-byte sectors */
@@ -131,6 +145,8 @@ struct pnfs_block_layout {
 	struct rb_root		bl_ext_rw;
 	struct rb_root		bl_ext_ro;
 	spinlock_t		bl_ext_lock;   /* Protects list manipulation */
+	bool			bl_scsi_layout;
+	u64			bl_lwb;
 };
 
 static inline struct pnfs_block_layout *
@@ -162,6 +178,7 @@ struct bl_msg_hdr {
 #define BL_DEVICE_REQUEST_ERR          0x2 /* User level process fails */
 
 /* dev.c */
+bool bl_register_dev(struct pnfs_block_dev *d);
 struct nfs4_deviceid_node *bl_alloc_deviceid_node(struct nfs_server *server,
 		struct pnfs_device *pdev, gfp_t gfp_mask);
 void bl_free_deviceid_node(struct nfs4_deviceid_node *d);
@@ -172,7 +189,7 @@ int ext_tree_insert(struct pnfs_block_layout *bl,
 int ext_tree_remove(struct pnfs_block_layout *bl, bool rw, sector_t start,
 		sector_t end);
 int ext_tree_mark_written(struct pnfs_block_layout *bl, sector_t start,
-		sector_t len);
+		sector_t len, u64 lwb);
 bool ext_tree_lookup(struct pnfs_block_layout *bl, sector_t isect,
 		struct pnfs_block_extent *ret, bool rw);
 int ext_tree_prepare_commit(struct nfs4_layoutcommit_args *arg);
@@ -182,6 +199,6 @@ void ext_tree_mark_committed(struct nfs4_layoutcommit_args *arg, int status);
 dev_t bl_resolve_deviceid(struct nfs_server *server,
 		struct pnfs_block_volume *b, gfp_t gfp_mask);
 int __init bl_init_pipefs(void);
-void __exit bl_cleanup_pipefs(void);
+void bl_cleanup_pipefs(void);
 
 #endif /* FS_NFS_NFS4BLOCKLAYOUT_H */

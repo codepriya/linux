@@ -1,5 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _M68K_IRQ_H_
 #define _M68K_IRQ_H_
+
+#include <linux/atomic.h>
+#include <linux/linkage.h>
 
 /*
  * This should be the same as the max(NUM_X_SOURCES) for all the
@@ -11,7 +15,8 @@
  */
 #if defined(CONFIG_COLDFIRE)
 #define NR_IRQS 256
-#elif defined(CONFIG_VME) || defined(CONFIG_SUN3) || defined(CONFIG_SUN3X)
+#elif defined(CONFIG_VME) || defined(CONFIG_SUN3) || \
+      defined(CONFIG_SUN3X) || defined(CONFIG_VIRT)
 #define NR_IRQS 200
 #elif defined(CONFIG_ATARI)
 #define NR_IRQS 141
@@ -57,6 +62,8 @@
 struct irq_data;
 struct irq_chip;
 struct irq_desc;
+struct pt_regs;
+
 extern unsigned int m68k_irq_startup(struct irq_data *data);
 extern unsigned int m68k_irq_startup_irq(unsigned int irq);
 extern void m68k_irq_shutdown(struct irq_data *data);

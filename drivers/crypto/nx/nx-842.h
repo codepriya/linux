@@ -1,11 +1,12 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 
 #ifndef __NX_842_H__
 #define __NX_842_H__
 
+#include <crypto/algapi.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/crypto.h>
 #include <linux/of.h>
 #include <linux/slab.h>
 #include <linux/io.h>
@@ -76,9 +77,17 @@
 #define CSB_CC_DECRYPT_OVERFLOW	(64)
 /* asym crypt codes */
 #define CSB_CC_MINV_OVERFLOW	(128)
+/*
+ * HW error - Job did not finish in the maximum time allowed.
+ * Job terminated.
+ */
+#define CSB_CC_HW_EXPIRED_TIMER		(224)
 /* These are reserved for hypervisor use */
 #define CSB_CC_HYP_RESERVE_START	(240)
 #define CSB_CC_HYP_RESERVE_END		(253)
+#define CSB_CC_HYP_RESERVE_P9_END	(251)
+/* No valid interrupt server (P9 or later). */
+#define CSB_CC_HYP_RESERVE_NO_INTR_SERVER	(252)
 #define CSB_CC_HYP_NO_HW		(254)
 #define CSB_CC_HYP_HANG_ABORTED		(255)
 
@@ -99,11 +108,6 @@ static inline unsigned long nx842_get_pa(void *addr)
 
 	return page_to_phys(vmalloc_to_page(addr)) + offset_in_page(addr);
 }
-
-/* Get/Set bit fields */
-#define MASK_LSH(m)		(__builtin_ffsl(m) - 1)
-#define GET_FIELD(v, m)		(((v) & (m)) >> MASK_LSH(m))
-#define SET_FIELD(v, m, val)	(((v) & ~(m)) | (((val) << MASK_LSH(m)) & (m)))
 
 /**
  * This provides the driver's constraints.  Different nx842 implementations
@@ -153,11 +157,16 @@ struct nx842_crypto_header_group {
 } __packed;
 
 struct nx842_crypto_header {
-	__be16 magic;		/* NX842_CRYPTO_MAGIC */
-	__be16 ignore;		/* decompressed end bytes to ignore */
-	u8 groups;		/* total groups in this header */
+	/* New members MUST be added within the struct_group() macro below. */
+	struct_group_tagged(nx842_crypto_header_hdr, hdr,
+		__be16 magic;		/* NX842_CRYPTO_MAGIC */
+		__be16 ignore;		/* decompressed end bytes to ignore */
+		u8 groups;		/* total groups in this header */
+	);
 	struct nx842_crypto_header_group group[];
 } __packed;
+static_assert(offsetof(struct nx842_crypto_header, group) == sizeof(struct nx842_crypto_header_hdr),
+	      "struct member likely outside of struct_group_tagged()");
 
 #define NX842_CRYPTO_GROUP_MAX	(0x20)
 
@@ -167,7 +176,7 @@ struct nx842_crypto_ctx {
 	u8 *wmem;
 	u8 *sbounce, *dbounce;
 
-	struct nx842_crypto_header header;
+	struct nx842_crypto_header_hdr header;
 	struct nx842_crypto_header_group group[NX842_CRYPTO_GROUP_MAX];
 
 	struct nx842_driver *driver;

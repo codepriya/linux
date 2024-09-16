@@ -61,20 +61,24 @@ typedef struct _ATOM_PPLIB_THERMALCONTROLLER
 #define ATOM_PP_THERMALCONTROLLER_LM96163   17
 #define ATOM_PP_THERMALCONTROLLER_CISLANDS  18
 #define ATOM_PP_THERMALCONTROLLER_KAVERI    19
+#define ATOM_PP_THERMALCONTROLLER_ICELAND   20
+#define ATOM_PP_THERMALCONTROLLER_TONGA     21
+#define ATOM_PP_THERMALCONTROLLER_FIJI      22
+#define ATOM_PP_THERMALCONTROLLER_POLARIS10 23
+#define ATOM_PP_THERMALCONTROLLER_VEGA10    24
 
 
 // Thermal controller 'combo type' to use an external controller for Fan control and an internal controller for thermal.
 // We probably should reserve the bit 0x80 for this use.
 // To keep the number of these types low we should also use the same code for all ASICs (i.e. do not distinguish RV6xx and RV7xx Internal here).
 // The driver can pick the correct internal controller based on the ASIC.
-
 #define ATOM_PP_THERMALCONTROLLER_ADT7473_WITH_INTERNAL   0x89    // ADT7473 Fan Control + Internal Thermal Controller
 #define ATOM_PP_THERMALCONTROLLER_EMC2103_WITH_INTERNAL   0x8D    // EMC2103 Fan Control + Internal Thermal Controller
 
 typedef struct _ATOM_PPLIB_STATE
 {
     UCHAR ucNonClockStateIndex;
-    UCHAR ucClockStateIndices[1]; // variable-sized
+    UCHAR ucClockStateIndices[]; // variable-sized
 } ATOM_PPLIB_STATE;
 
 
@@ -104,6 +108,21 @@ typedef struct _ATOM_PPLIB_FANTABLE3
 	USHORT usFanOutputSensitivity;
 } ATOM_PPLIB_FANTABLE3;
 
+typedef struct _ATOM_PPLIB_FANTABLE4
+{
+    ATOM_PPLIB_FANTABLE3 basicTable3;
+    USHORT  usFanRPMMax;
+} ATOM_PPLIB_FANTABLE4;
+
+typedef struct _ATOM_PPLIB_FANTABLE5
+{
+    ATOM_PPLIB_FANTABLE4 basicTable4;
+    USHORT  usFanCurrentLow;
+    USHORT  usFanCurrentHigh;
+    USHORT  usFanRPMLow;
+    USHORT  usFanRPMHigh;
+} ATOM_PPLIB_FANTABLE5;
+
 typedef struct _ATOM_PPLIB_EXTENDEDHEADER
 {
     USHORT  usSize;
@@ -119,6 +138,7 @@ typedef struct _ATOM_PPLIB_EXTENDEDHEADER
     USHORT  usPowerTuneTableOffset;
     /* points to ATOM_PPLIB_CLOCK_Voltage_Dependency_Table for sclkVddgfxTable */
     USHORT  usSclkVddgfxTableOffset;
+    USHORT  usVQBudgetingTableOffset; /* points to the vqBudgetingTable; */
 } ATOM_PPLIB_EXTENDEDHEADER;
 
 //// ATOM_PPLIB_POWERPLAYTABLE::ulPlatformCaps
@@ -147,8 +167,9 @@ typedef struct _ATOM_PPLIB_EXTENDEDHEADER
 #define ATOM_PP_PLATFORM_CAP_TEMP_INVERSION   0x00400000            // Does the driver supports Temp Inversion feature.
 #define ATOM_PP_PLATFORM_CAP_EVV    0x00800000
 #define ATOM_PP_PLATFORM_COMBINE_PCC_WITH_THERMAL_SIGNAL    0x01000000
-#define ATOM_PP_PLATFORM_LOAD_POST_PRODUCTION_FIRMWARE      0x02000000
-#define ATOM_PP_PLATFORM_CAP_DISABLE_USING_ACTUAL_TEMPERATURE_FOR_POWER_CALC 0x04000000
+#define ATOM_PP_PLATFORM_LOAD_POST_PRODUCTION_FIRMWARE    0x02000000
+#define ATOM_PP_PLATFORM_CAP_DISABLE_USING_ACTUAL_TEMPERATURE_FOR_POWER_CALC   0x04000000
+#define ATOM_PP_PLATFORM_CAP_VRHOT_POLARITY_HIGH   0x08000000
 
 typedef struct _ATOM_PPLIB_POWERPLAYTABLE
 {
@@ -427,6 +448,15 @@ typedef struct _ATOM_PPLIB_SUMO_CLOCK_INFO{
       ULONG rsv2[2];
 }ATOM_PPLIB_SUMO_CLOCK_INFO;
 
+typedef struct _ATOM_PPLIB_KV_CLOCK_INFO {
+      USHORT usEngineClockLow;
+      UCHAR  ucEngineClockHigh;
+      UCHAR  vddcIndex;
+      USHORT tdpLimit;
+      USHORT rsv1;
+      ULONG rsv2[2];
+} ATOM_PPLIB_KV_CLOCK_INFO;
+
 typedef struct _ATOM_PPLIB_CZ_CLOCK_INFO {
       UCHAR index;
       UCHAR rsv[3];
@@ -443,35 +473,34 @@ typedef struct _ATOM_PPLIB_STATE_V2
       /**
       * Driver will read the first ucNumDPMLevels in this array
       */
-      UCHAR clockInfoIndex[1];
+      UCHAR clockInfoIndex[];
 } ATOM_PPLIB_STATE_V2;
 
 typedef struct _StateArray{
-    //how many states we have 
-    UCHAR ucNumEntries;
-    
-    ATOM_PPLIB_STATE_V2 states[1];
+	//how many states we have
+	UCHAR ucNumEntries;
+
+	ATOM_PPLIB_STATE_V2 states[] /* __counted_by(ucNumEntries) */;
 }StateArray;
 
 
 typedef struct _ClockInfoArray{
-    //how many clock levels we have
-    UCHAR ucNumEntries;
-    
-    //sizeof(ATOM_PPLIB_CLOCK_INFO)
-    UCHAR ucEntrySize;
-    
-    UCHAR clockInfo[1];
+	//how many clock levels we have
+	UCHAR ucNumEntries;
+
+	//sizeof(ATOM_PPLIB_CLOCK_INFO)
+	UCHAR ucEntrySize;
+
+	UCHAR clockInfo[];
 }ClockInfoArray;
 
 typedef struct _NonClockInfoArray{
+	//how many non-clock levels we have. normally should be same as number of states
+	UCHAR ucNumEntries;
+	//sizeof(ATOM_PPLIB_NONCLOCK_INFO)
+	UCHAR ucEntrySize;
 
-    //how many non-clock levels we have. normally should be same as number of states
-    UCHAR ucNumEntries;
-    //sizeof(ATOM_PPLIB_NONCLOCK_INFO)
-    UCHAR ucEntrySize;
-    
-    ATOM_PPLIB_NONCLOCK_INFO nonClockInfo[1];
+	ATOM_PPLIB_NONCLOCK_INFO nonClockInfo[] __counted_by(ucNumEntries);
 }NonClockInfoArray;
 
 typedef struct _ATOM_PPLIB_Clock_Voltage_Dependency_Record
@@ -483,8 +512,10 @@ typedef struct _ATOM_PPLIB_Clock_Voltage_Dependency_Record
 
 typedef struct _ATOM_PPLIB_Clock_Voltage_Dependency_Table
 {
-    UCHAR ucNumEntries;                                                // Number of entries.
-    ATOM_PPLIB_Clock_Voltage_Dependency_Record entries[1];             // Dynamically allocate entries.
+	// Number of entries.
+	UCHAR ucNumEntries;
+	// Dynamically allocate entries.
+	ATOM_PPLIB_Clock_Voltage_Dependency_Record entries[] __counted_by(ucNumEntries);
 }ATOM_PPLIB_Clock_Voltage_Dependency_Table;
 
 typedef struct _ATOM_PPLIB_Clock_Voltage_Limit_Record
@@ -499,8 +530,10 @@ typedef struct _ATOM_PPLIB_Clock_Voltage_Limit_Record
 
 typedef struct _ATOM_PPLIB_Clock_Voltage_Limit_Table
 {
-    UCHAR ucNumEntries;                                                // Number of entries.
-    ATOM_PPLIB_Clock_Voltage_Limit_Record entries[1];                  // Dynamically allocate entries.
+	// Number of entries.
+	UCHAR ucNumEntries;
+	// Dynamically allocate entries.
+	ATOM_PPLIB_Clock_Voltage_Limit_Record entries[] __counted_by(ucNumEntries);
 }ATOM_PPLIB_Clock_Voltage_Limit_Table;
 
 union _ATOM_PPLIB_CAC_Leakage_Record
@@ -523,8 +556,10 @@ typedef union _ATOM_PPLIB_CAC_Leakage_Record ATOM_PPLIB_CAC_Leakage_Record;
 
 typedef struct _ATOM_PPLIB_CAC_Leakage_Table
 {
-    UCHAR ucNumEntries;                                                 // Number of entries.
-    ATOM_PPLIB_CAC_Leakage_Record entries[1];                           // Dynamically allocate entries.
+	// Number of entries.
+	UCHAR ucNumEntries;
+	// Dynamically allocate entries.
+	ATOM_PPLIB_CAC_Leakage_Record entries[] __counted_by(ucNumEntries);
 }ATOM_PPLIB_CAC_Leakage_Table;
 
 typedef struct _ATOM_PPLIB_PhaseSheddingLimits_Record
@@ -538,8 +573,10 @@ typedef struct _ATOM_PPLIB_PhaseSheddingLimits_Record
 
 typedef struct _ATOM_PPLIB_PhaseSheddingLimits_Table
 {
-    UCHAR ucNumEntries;                                                 // Number of entries.
-    ATOM_PPLIB_PhaseSheddingLimits_Record entries[1];                   // Dynamically allocate entries.
+	// Number of entries.
+	UCHAR ucNumEntries;
+	// Dynamically allocate entries.
+	ATOM_PPLIB_PhaseSheddingLimits_Record entries[] __counted_by(ucNumEntries);
 }ATOM_PPLIB_PhaseSheddingLimits_Table;
 
 typedef struct _VCEClockInfo{
@@ -550,8 +587,8 @@ typedef struct _VCEClockInfo{
 }VCEClockInfo;
 
 typedef struct _VCEClockInfoArray{
-    UCHAR ucNumEntries;
-    VCEClockInfo entries[1];
+	UCHAR ucNumEntries;
+	VCEClockInfo entries[] __counted_by(ucNumEntries);
 }VCEClockInfoArray;
 
 typedef struct _ATOM_PPLIB_VCE_Clock_Voltage_Limit_Record
@@ -562,8 +599,8 @@ typedef struct _ATOM_PPLIB_VCE_Clock_Voltage_Limit_Record
 
 typedef struct _ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table
 {
-    UCHAR numEntries;
-    ATOM_PPLIB_VCE_Clock_Voltage_Limit_Record entries[1];
+	UCHAR numEntries;
+	ATOM_PPLIB_VCE_Clock_Voltage_Limit_Record entries[] __counted_by(numEntries);
 }ATOM_PPLIB_VCE_Clock_Voltage_Limit_Table;
 
 typedef struct _ATOM_PPLIB_VCE_State_Record
@@ -574,8 +611,8 @@ typedef struct _ATOM_PPLIB_VCE_State_Record
 
 typedef struct _ATOM_PPLIB_VCE_State_Table
 {
-    UCHAR numEntries;
-    ATOM_PPLIB_VCE_State_Record entries[1];
+	UCHAR numEntries;
+	ATOM_PPLIB_VCE_State_Record entries[] __counted_by(numEntries);
 }ATOM_PPLIB_VCE_State_Table;
 
 
@@ -596,8 +633,8 @@ typedef struct _UVDClockInfo{
 }UVDClockInfo;
 
 typedef struct _UVDClockInfoArray{
-    UCHAR ucNumEntries;
-    UVDClockInfo entries[1];
+	UCHAR ucNumEntries;
+	UVDClockInfo entries[] __counted_by(ucNumEntries);
 }UVDClockInfoArray;
 
 typedef struct _ATOM_PPLIB_UVD_Clock_Voltage_Limit_Record
@@ -608,8 +645,8 @@ typedef struct _ATOM_PPLIB_UVD_Clock_Voltage_Limit_Record
 
 typedef struct _ATOM_PPLIB_UVD_Clock_Voltage_Limit_Table
 {
-    UCHAR numEntries;
-    ATOM_PPLIB_UVD_Clock_Voltage_Limit_Record entries[1];
+	UCHAR numEntries;
+	ATOM_PPLIB_UVD_Clock_Voltage_Limit_Record entries[] __counted_by(numEntries);
 }ATOM_PPLIB_UVD_Clock_Voltage_Limit_Table;
 
 typedef struct _ATOM_PPLIB_UVD_Table
@@ -627,8 +664,8 @@ typedef struct _ATOM_PPLIB_SAMClk_Voltage_Limit_Record
 }ATOM_PPLIB_SAMClk_Voltage_Limit_Record;
 
 typedef struct _ATOM_PPLIB_SAMClk_Voltage_Limit_Table{
-    UCHAR numEntries;
-    ATOM_PPLIB_SAMClk_Voltage_Limit_Record entries[1];
+	UCHAR numEntries;
+	ATOM_PPLIB_SAMClk_Voltage_Limit_Record entries[] __counted_by(numEntries);
 }ATOM_PPLIB_SAMClk_Voltage_Limit_Table;
 
 typedef struct _ATOM_PPLIB_SAMU_Table
@@ -645,8 +682,8 @@ typedef struct _ATOM_PPLIB_ACPClk_Voltage_Limit_Record
 }ATOM_PPLIB_ACPClk_Voltage_Limit_Record;
 
 typedef struct _ATOM_PPLIB_ACPClk_Voltage_Limit_Table{
-    UCHAR numEntries;
-    ATOM_PPLIB_ACPClk_Voltage_Limit_Record entries[1];
+	UCHAR numEntries;
+	ATOM_PPLIB_ACPClk_Voltage_Limit_Record entries[] __counted_by(numEntries);
 }ATOM_PPLIB_ACPClk_Voltage_Limit_Table;
 
 typedef struct _ATOM_PPLIB_ACP_Table
@@ -696,6 +733,27 @@ typedef struct _ATOM_PPLIB_PPM_Table
       ULONG  ulDGpuUlvPower;
       ULONG  ulTjmax;
 } ATOM_PPLIB_PPM_Table;
+
+#define    VQ_DisplayConfig_NoneAWD   1
+#define    VQ_DisplayConfig_AWD       2
+
+typedef struct ATOM_PPLIB_VQ_Budgeting_Record{
+    ULONG ulDeviceID;
+    ULONG ulSustainableSOCPowerLimitLow; /* in mW */
+    ULONG ulSustainableSOCPowerLimitHigh; /* in mW */
+
+    ULONG ulDClk;
+    ULONG ulEClk;
+    ULONG ulDispSclk;
+    UCHAR ucDispConfig;
+
+} ATOM_PPLIB_VQ_Budgeting_Record;
+
+typedef struct ATOM_PPLIB_VQ_Budgeting_Table {
+	UCHAR revid;
+	UCHAR numEntries;
+	ATOM_PPLIB_VQ_Budgeting_Record entries[] __counted_by(numEntries);
+} ATOM_PPLIB_VQ_Budgeting_Table;
 
 #pragma pack()
 

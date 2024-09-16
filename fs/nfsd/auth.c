@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /* Copyright (C) 1995, 1996 Olaf Kirch <okir@monad.swb.de> */
 
 #include <linux/sched.h>
@@ -24,8 +25,6 @@ int nfsd_setuser(struct svc_rqst *rqstp, struct svc_export *exp)
 	struct cred *new;
 	int i;
 	int flags = nfsexp_flags(rqstp, exp);
-
-	validate_process_creds();
 
 	/* discard any old override before preparing the new set */
 	revert_creds(get_cred(current_real_cred()));
@@ -55,11 +54,14 @@ int nfsd_setuser(struct svc_rqst *rqstp, struct svc_export *exp)
 			goto oom;
 
 		for (i = 0; i < rqgi->ngroups; i++) {
-			if (gid_eq(GLOBAL_ROOT_GID, GROUP_AT(rqgi, i)))
-				GROUP_AT(gi, i) = exp->ex_anon_gid;
+			if (gid_eq(GLOBAL_ROOT_GID, rqgi->gid[i]))
+				gi->gid[i] = exp->ex_anon_gid;
 			else
-				GROUP_AT(gi, i) = GROUP_AT(rqgi, i);
+				gi->gid[i] = rqgi->gid[i];
 		}
+
+		/* Each thread allocates its own gi, no race */
+		groups_sort(gi);
 	} else {
 		gi = get_group_info(rqgi);
 	}
@@ -77,10 +79,8 @@ int nfsd_setuser(struct svc_rqst *rqstp, struct svc_export *exp)
 	else
 		new->cap_effective = cap_raise_nfsd_set(new->cap_effective,
 							new->cap_permitted);
-	validate_process_creds();
 	put_cred(override_creds(new));
 	put_cred(new);
-	validate_process_creds();
 	return 0;
 
 oom:

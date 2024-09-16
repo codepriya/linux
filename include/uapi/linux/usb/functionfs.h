@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 #ifndef _UAPI__LINUX_FUNCTIONFS_H__
 #define _UAPI__LINUX_FUNCTIONFS_H__
 
@@ -21,6 +22,8 @@ enum functionfs_flags {
 	FUNCTIONFS_HAS_MS_OS_DESC = 8,
 	FUNCTIONFS_VIRTUAL_ADDR = 16,
 	FUNCTIONFS_EVENTFD = 32,
+	FUNCTIONFS_ALL_CTRL_RECIP = 64,
+	FUNCTIONFS_CONFIG0_SETUP = 128,
 };
 
 /* Descriptor of an non-audio endpoint */
@@ -70,8 +73,10 @@ struct usb_os_desc_header {
 struct usb_ext_compat_desc {
 	__u8	bFirstInterfaceNumber;
 	__u8	Reserved1;
-	__u8	CompatibleID[8];
-	__u8	SubCompatibleID[8];
+	__struct_group(/* no tag */, IDs, /* no attrs */,
+		__u8	CompatibleID[8];
+		__u8	SubCompatibleID[8];
+	);
 	__u8	Reserved2[6];
 };
 
@@ -79,6 +84,22 @@ struct usb_ext_prop_desc {
 	__le32	dwSize;
 	__le32	dwPropertyDataType;
 	__le16	wPropertyNameLength;
+} __attribute__((packed));
+
+/* Flags for usb_ffs_dmabuf_transfer_req->flags (none for now) */
+#define USB_FFS_DMABUF_TRANSFER_MASK	0x0
+
+/**
+ * struct usb_ffs_dmabuf_transfer_req - Transfer request for a DMABUF object
+ * @fd:		file descriptor of the DMABUF object
+ * @flags:	one or more USB_FFS_DMABUF_TRANSFER_* flags
+ * @length:	number of bytes used in this DMABUF for the data transfer.
+ *		Should generally be set to the DMABUF's size.
+ */
+struct usb_ffs_dmabuf_transfer_req {
+	int fd;
+	__u32 flags;
+	__u64 length;
 } __attribute__((packed));
 
 #ifndef __KERNEL__
@@ -91,6 +112,7 @@ struct usb_ext_prop_desc {
  * |   0 | magic     | LE32         | FUNCTIONFS_DESCRIPTORS_MAGIC_V2      |
  * |   4 | length    | LE32         | length of the whole data chunk       |
  * |   8 | flags     | LE32         | combination of functionfs_flags      |
+ * |     | eventfd   | LE32         | eventfd file descriptor              |
  * |     | fs_count  | LE32         | number of full-speed descriptors     |
  * |     | hs_count  | LE32         | number of high-speed descriptors     |
  * |     | ss_count  | LE32         | number of super-speed descriptors    |
@@ -155,7 +177,7 @@ struct usb_ext_prop_desc {
  * |-----+-----------------------+------+-------------------------------------|
  * |   0 | bFirstInterfaceNumber | U8   | index of the interface or of the 1st|
  * |     |                       |      | interface in an IAD group           |
- * |   1 | Reserved              | U8   | 0                                   |
+ * |   1 | Reserved              | U8   | 1                                   |
  * |   2 | CompatibleID          | U8[8]| compatible ID string                |
  * |  10 | SubCompatibleID       | U8[8]| subcompatible ID string             |
  * |  18 | Reserved              | U8[6]| 0                                   |
@@ -272,17 +294,43 @@ struct usb_functionfs_event {
 #define	FUNCTIONFS_INTERFACE_REVMAP	_IO('g', 128)
 
 /*
- * Returns real bEndpointAddress of an endpoint.  If function is not
- * active returns -ENODEV.
+ * Returns real bEndpointAddress of an endpoint. If endpoint shuts down
+ * during the call, returns -ESHUTDOWN.
  */
 #define	FUNCTIONFS_ENDPOINT_REVMAP	_IO('g', 129)
 
 /*
- * Returns endpoint descriptor. If function is not active returns -ENODEV.
+ * Returns endpoint descriptor. If endpoint shuts down during the call,
+ * returns -ESHUTDOWN.
  */
 #define	FUNCTIONFS_ENDPOINT_DESC	_IOR('g', 130, \
 					     struct usb_endpoint_descriptor)
 
+/*
+ * Attach the DMABUF object, identified by its file descriptor, to the
+ * data endpoint. Returns zero on success, and a negative errno value
+ * on error.
+ */
+#define FUNCTIONFS_DMABUF_ATTACH	_IOW('g', 131, int)
 
+
+/*
+ * Detach the given DMABUF object, identified by its file descriptor,
+ * from the data endpoint. Returns zero on success, and a negative
+ * errno value on error. Note that closing the endpoint's file
+ * descriptor will automatically detach all attached DMABUFs.
+ */
+#define FUNCTIONFS_DMABUF_DETACH	_IOW('g', 132, int)
+
+/*
+ * Enqueue the previously attached DMABUF to the transfer queue.
+ * The argument is a structure that packs the DMABUF's file descriptor,
+ * the size in bytes to transfer (which should generally correspond to
+ * the size of the DMABUF), and a 'flags' field which is unused
+ * for now. Returns zero on success, and a negative errno value on
+ * error.
+ */
+#define FUNCTIONFS_DMABUF_TRANSFER	_IOW('g', 133, \
+					     struct usb_ffs_dmabuf_transfer_req)
 
 #endif /* _UAPI__LINUX_FUNCTIONFS_H__ */
